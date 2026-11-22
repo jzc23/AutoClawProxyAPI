@@ -178,6 +178,82 @@ func TestExplainOAuthExchangeBizError(t *testing.T) {
 	}
 }
 
+func TestAssembleChatCompletionFromSSE(t *testing.T) {
+	// 1. 常规聚合：content 增量 + reasoning + usage 原样保留 + finish_reason
+	sse := "data: {\"id\":\"cmpl-x\",\"created\":1700000000,\"model\":\"glm-5.3-flash\",\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"思考中\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"，世界\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":4,\"total_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":6}}}\n\n" +
+		"data: [DONE]\n\n"
+	out, err := AssembleChatCompletionFromSSE([]byte(sse), "fallback")
+	if err != nil {
+		t.Fatalf("聚合失败: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["object"] != "chat.completion" || m["model"] != "glm-5.3-flash" || m["id"] != "cmpl-x" {
+		t.Fatalf("聚合元信息不符: %v", m)
+	}
+	ch0 := m["choices"].([]any)[0].(map[string]any)
+	if ch0["finish_reason"] != "stop" {
+		t.Fatalf("finish_reason 应为 stop: %v", ch0)
+	}
+	msg := ch0["message"].(map[string]any)
+	if msg["content"] != "你好，世界" {
+		t.Fatalf("content 应聚合完整文本: %v", msg)
+	}
+	if msg["reasoning_content"] != "思考中" {
+		t.Fatalf("reasoning_content 应保留: %v", msg)
+	}
+	usage := m["usage"].(map[string]any)
+	if usage["prompt_tokens"].(float64) != 8 {
+		t.Fatalf("usage 应原样保留: %v", usage)
+	}
+
+	// 2. 工具调用聚合：按 index 排序、参数增量拼接、缺失 ID 自动补齐
+	toolSSE := "data: {\"id\":\"cmpl-t\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-b\",\"function\":{\"name\":\"toolB\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"toolA\",\"arguments\":\"{\\\"x\\\":\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	out2, err := AssembleChatCompletionFromSSE([]byte(toolSSE), "m")
+	if err != nil {
+		t.Fatalf("工具调用聚合失败: %v", err)
+	}
+	var m2 map[string]any
+	_ = json.Unmarshal(out2, &m2)
+	msg2 := m2["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg2["content"] != nil {
+		t.Fatalf("仅有工具调用时 content 应为 null: %v", msg2)
+	}
+	tcs := msg2["tool_calls"].([]any)
+	if len(tcs) != 2 {
+		t.Fatalf("应聚合出 2 个工具调用: %v", tcs)
+	}
+	first := tcs[0].(map[string]any)
+	if first["id"] != "call-a" {
+		t.Fatalf("工具调用应按 index 排序: %v", tcs)
+	}
+	if first["function"].(map[string]any)["arguments"] != "{\"x\":1}" {
+		t.Fatalf("arguments 增量应拼接完整: %v", first)
+	}
+
+	// 3. 上游忽略 stream 参数返回普通 JSON 时原样透传
+	direct := []byte(`{"id":"cmpl-1","object":"chat.completion","model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"直连"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	out3, err := AssembleChatCompletionFromSSE(direct, "m")
+	if err != nil || !strings.Contains(string(out3), "直连") {
+		t.Fatalf("无 SSE data 行时应按普通 JSON 透传: %v %s", err, out3)
+	}
+
+	// 4. 流提前中断（无 finish_reason）应报瞬态错误，交由上层切号
+	truncated := "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\n"
+	if _, err := AssembleChatCompletionFromSSE([]byte(truncated), "m"); err == nil {
+		t.Fatal("无 finish_reason 的中断流应返回错误")
+	}
+}
+
 func TestClassifyErrorRateLimitVsCreditAnd403(t *testing.T) {
 	// 429 + "rate limit reached" 文案：必须先按 429 判软限流短冷却，
 	// 而不是命中 hard_credit 的 "limit reached" 短语导致长冷却

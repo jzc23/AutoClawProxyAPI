@@ -184,13 +184,19 @@ func TestGatewayAuthFailoverAndPerAccountProxy(t *testing.T) {
 		return nil
 	})
 
-	// 1. Bearer 鉴权 + /v1/chat/completions 自动切号验证
+	// 1. Bearer 鉴权 + /v1/chat/completions 自动切号验证。
+	// 非流式请求在上游侧走内部流式聚合（防上游网关 504），
+	// 因此 mock 命中的是流式分支，返回"你好世界"聚合出的完整 JSON。
 	chatReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":"测试"}]}`))
 	chatReq.Header.Set("Authorization", "Bearer "+vkey)
 	chatRec := httptest.NewRecorder()
 	handler.ServeHTTP(chatRec, chatReq)
-	if chatRec.Code != http.StatusOK || !strings.Contains(chatRec.Body.String(), "网关回复正常") {
-		t.Fatalf("故障切号后应成功响应，实际 status=%d body=%s", chatRec.Code, chatRec.Body.String())
+	bodyStr := chatRec.Body.String()
+	if chatRec.Code != http.StatusOK || !strings.Contains(bodyStr, "你好世界") {
+		t.Fatalf("故障切号后应成功响应（内部流式聚合），实际 status=%d body=%s", chatRec.Code, bodyStr)
+	}
+	if !strings.Contains(bodyStr, `"finish_reason":"stop"`) || !strings.Contains(bodyStr, `"usage":{`) {
+		t.Fatalf("聚合结果应包含 finish_reason 与 usage，实际: %s", bodyStr)
 	}
 	if upstreamHits.Load() != 2 {
 		t.Fatalf("预期切号重试共命中上游 2 次，实际: %d", upstreamHits.Load())
