@@ -177,9 +177,8 @@ func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, body io.Reader, 
 }
 
 // executeChatWithFailover 执行带指数退避与自动切号故障转移的非流式对话请求。
-// 上游侧统一走内部流式聚合（ChatCompletionAggregated），避免非流式长生成被上游
-// 网关超时掐断返回 504；同一会话在 15 分钟内优先粘性复用上次成功的账号以提升
-// 上游 Prompt Cache 命中率，遇限流/积分不足/失效切号时自动改绑新账号。
+// 同一会话在 15 分钟内优先粘性复用上次成功的账号以提升上游 Prompt Cache 命中率，
+// 遇限流/积分不足/失效切号时自动改绑新账号。
 func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel string, chatBody []byte) ([]byte, *accounts.Account, error) {
 	targets, err := s.router.ResolveTargets(requestedModel)
 	if err != nil {
@@ -223,7 +222,7 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 			}
 			continue
 		}
-		respBytes, errCall := protocol.ChatCompletionAggregated(ctx, client, protocol.ChatRequest{
+		respBytes, errCall := protocol.ChatCompletion(ctx, client, protocol.ChatRequest{
 			BaseURL: baseURL,
 			Token:   acc.Cred.AccessToken,
 			Model:   target.UpstreamModel,

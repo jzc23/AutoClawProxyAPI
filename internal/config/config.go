@@ -21,8 +21,7 @@ import (
 // 新增会话粘性调度（Prompt Cache 优化）、后台余额定时刷新与流式 usage 默认回传。
 // v1.0.2: 修复限流误判长冷却与 403 误判会话死亡，onclick 注入加固，面板登录防爆破，
 // 密码哈希升级 PBKDF2，vKey 生成消除模偏差，启动免鉴权告警与流式响应头超时。
-// v1.0.3: 非流式请求上游侧改为内部流式聚合，根治非流式长生成被上游网关超时掐断的 504。
-const Version = "v1.0.3"
+const Version = "v1.0.2"
 
 // PanelAuth 保存 Web 控制台登录密码的安全哈希（不存明文）。
 type PanelAuth struct {
