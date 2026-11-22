@@ -99,7 +99,9 @@ func (r *Router) activeAccountsForRegion(region protocol.Region) []Account {
 }
 
 // SyncRegionModels 实时同步指定区域的模型目录。
-// 若该区域不存在已启用且未失效的账号，立刻清空该区域模型目录；若上游探测失败，记录明确原因且绝不回落编造假模型。
+// 若该区域不存在已启用且未失效的账号，立刻清空该区域模型目录；若上游探测失败，
+// 记录明确原因且绝不回落编造假模型。区域仍有活跃账号时保留上次成功同步的缓存目录，
+// 避免后台周期探测的瞬时网络失败导致 /v1/models 闪断、下游误判整个渠道不可用。
 func (r *Router) SyncRegionModels(ctx context.Context, region protocol.Region) ([]protocol.ModelMeta, error) {
 	candidates := r.activeAccountsForRegion(region)
 	if len(candidates) == 0 {
@@ -148,14 +150,26 @@ func (r *Router) SyncRegionModels(ctx context.Context, region protocol.Region) (
 	if lastErr != nil {
 		errMsg = lastErr.Error()
 	}
+	// hasActiveAccount 内部会取读锁，必须在取写锁前调用
+	hasActive := r.hasActiveAccount(region)
 	r.mu.Lock()
-	delete(r.modelsByRegion, region)
+	cachedCount := len(r.modelsByRegion[region])
+	if !hasActive {
+		delete(r.modelsByRegion, region)
+	} else if cachedCount > 0 {
+		errMsg = fmt.Sprintf("本次同步失败，已保留上次缓存的 %d 个模型待下轮重试: %s", cachedCount, errMsg)
+	}
 	r.lastSyncAt[region] = time.Now()
 	r.lastSyncErr[region] = errMsg
 	r.mu.Unlock()
 
 	if r.logger != nil {
-		r.logger.Warn("Router", "实时同步 %s 模型目录失败（不回落静态列表）: %s", region.DisplayName(), errMsg)
+		if hasActive && cachedCount > 0 {
+			r.logger.Warn("Router", "实时同步 %s 模型目录失败，区域仍有活跃账号，保留缓存目录（%d 个模型）: %s",
+				region.DisplayName(), cachedCount, errMsg)
+		} else {
+			r.logger.Warn("Router", "实时同步 %s 模型目录失败（不回落静态列表）: %s", region.DisplayName(), errMsg)
+		}
 	}
 	return nil, errors.New(errMsg)
 }

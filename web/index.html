@@ -1265,6 +1265,13 @@ function formatExpiry(ts){
   const diff = ts - now;
   const d = new Date(ts * 1000).toLocaleDateString('zh-CN');
   if (diff <= 0) return `<span class="err">已过期 (${d})</span>`;
+  // 短效令牌（如国际版 24h）按小时展示，避免刚登录就恒显「剩 0 天」黄色告警；仅剩余 <= 4 小时时标黄
+  if (diff < 86400) {
+    const h = Math.floor(diff / 3600);
+    const m = Math.floor((diff % 3600) / 60);
+    const label = h > 0 ? `剩 ${h} 小时${m > 0 ? ` ${m} 分` : ''}` : `剩 ${m} 分钟`;
+    return h <= 4 ? `<span class="warn">${label} (${d})</span>` : `<span>${label} (${d})</span>`;
+  }
   const days = Math.floor(diff / 86400);
   if (days <= 3) return `<span class="warn">剩 ${days} 天 (${d})</span>`;
   return `<span>剩 ${days} 天 (${d})</span>`;

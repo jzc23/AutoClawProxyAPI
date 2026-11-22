@@ -41,6 +41,8 @@ type Server struct {
 
 	sessionMu     sync.RWMutex
 	panelSessions map[string]panelSession
+
+	sticky *stickyTable
 }
 
 // NewServer 构造网关服务实例。
@@ -62,6 +64,7 @@ func NewServer(
 		startedAt:     time.Now(),
 		oauthSessions: make(map[string]oauthSession),
 		panelSessions: make(map[string]panelSession),
+		sticky:        newStickyTable(),
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -252,17 +253,21 @@ func TestRouterRealtimeSyncAndEmptyWhenNoActiveAccount(t *testing.T) {
 		t.Fatalf("同步后应暴露 2 条记录，实际: %+v", got)
 	}
 
-	// 3. 上游探测失败时，返回明确错误且绝不回落编造静态假模型
+	// 3. 上游探测失败时，返回明确错误且绝不回落编造静态假模型；
+	//    区域仍有活跃账号，应保留上次成功同步的缓存目录，避免 /v1/models 闪断
 	failUpstream.Store(true)
 	if _, err := router.SyncRegionModels(context.Background(), protocol.RegionCN); err == nil {
 		t.Fatalf("上游探测失败时应返回错误")
 	}
-	if got := router.ListOpenAIModels(); len(got) != 0 {
-		t.Fatalf("探测失败后不应编造或残留假模型，实际: %+v", got)
+	if got := router.ListOpenAIModels(); len(got) != 2 { // 缓存保留：裸名 + autoclawcn: 前缀
+		t.Fatalf("区域仍有活跃账号时探测失败应保留缓存目录（不编造假模型也不闪断清空），实际: %+v", got)
 	}
 	st := router.SyncStatuses()["cn"]
 	if st.ErrorMessage == "" {
 		t.Fatalf("探测失败后应记录清晰失败原因供页面展示")
+	}
+	if !strings.Contains(st.ErrorMessage, "保留上次缓存的") {
+		t.Fatalf("失败原因应说明已保留缓存目录: %s", st.ErrorMessage)
 	}
 
 	// 4. 恢复探测成功后，停用该最后一个账号，目录立即清空且不暴露

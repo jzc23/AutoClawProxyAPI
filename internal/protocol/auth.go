@@ -243,7 +243,7 @@ func ExchangeOAuthCode(ctx context.Context, client *http.Client, baseURL string,
 	}
 	bizCode, msg, data := unpackLoginEnvelope(raw)
 	if bizCode != 0 {
-		return nil, errors.New(explainLoginBizError(true, bizCode, msg))
+		return nil, errors.New(explainOAuthExchangeBizError(bizCode, msg))
 	}
 	return decodeLoginAccount(data, RegionGlobal, deviceID)
 }
@@ -412,4 +412,34 @@ func explainLoginBizError(isOAuth bool, code int64, upstreamMsg string) string {
 		return "登录失败：" + msg
 	}
 	return fmt.Sprintf("登录失败（上游业务码 %d）", code)
+}
+
+// explainOAuthExchangeBizError 解释国际版 OAuth 第二步（code/state 换票）阶段的业务码。
+// 该阶段不涉及滑块验证，上游同样可能返回 630014（换票风控/审核未通过），不能复用第一步的
+// 「人机验证未通过」文案误导用户重试滑块，因此单独拆分并在报错中保留上游原始 code 与 msg。
+func explainOAuthExchangeBizError(code int64, upstreamMsg string) string {
+	hint := ""
+	switch code {
+	case 400002:
+		hint = "请求签名校验失败（请检查本机系统时间是否准确）"
+	case 630014:
+		hint = "换票阶段触发上游风控/审核未通过（常见于同 IP 连续登录多个新账号或浏览器与换票出口 IP 不一致），并非滑块验证问题，请稍后更换网络环境重试"
+	case 631001:
+		hint = "回调授权码无效或已过期，请重新发起授权"
+	case 631002:
+		hint = "上游要求过风控验证，请稍后重试"
+	case BizCodeNotLoggedIn, BizCodeAuthExpired:
+		hint = "登录状态已失效，请重新登录"
+	}
+	msg := strings.TrimSpace(upstreamMsg)
+	switch {
+	case hint != "" && msg != "":
+		return fmt.Sprintf("%s（code=%d，%s）", hint, code, msg)
+	case hint != "":
+		return fmt.Sprintf("%s（code=%d）", hint, code)
+	case msg != "":
+		return fmt.Sprintf("换票失败（code=%d，%s）", code, msg)
+	default:
+		return fmt.Sprintf("换票失败（上游业务码 %d）", code)
+	}
 }

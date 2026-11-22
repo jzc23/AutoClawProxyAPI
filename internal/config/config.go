@@ -16,7 +16,9 @@ import (
 )
 
 // Version 声明当前程序版本号。
-const Version = "v1.0.0"
+// v1.0.1: 修复国际版令牌续期阈值/换票报错/签到重复触发/模型目录闪断，移除 x_trace_id 明文标识；
+// 新增会话粘性调度（Prompt Cache 优化）、后台余额定时刷新与流式 usage 默认回传。
+const Version = "v1.0.1"
 
 // PanelAuth 保存 Web 控制台登录密码的安全哈希（不存明文）。
 type PanelAuth struct {

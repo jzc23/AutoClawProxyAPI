@@ -32,8 +32,14 @@ func TestThreeHeaderSetsIsolated(t *testing.T) {
 	if reqChat.Header.Get("X-Request-Model") != "glm-5.3-flash" {
 		t.Fatalf("对话头缺少 X-Request-Model")
 	}
-	if reqChat.Header.Get("x_trace_id") != "autoclaw2api" {
-		t.Fatalf("对话头 x_trace_id 应为 autoclaw2api，实际: %s", reqChat.Header.Get("x_trace_id"))
+	traceID := reqChat.Header.Get("x_trace_id")
+	if len(traceID) != 16 || traceID != reqChat.Header.Get("X-Trace-Id") {
+		t.Fatalf("对话头 x_trace_id 应为 16 位随机串且与 X-Trace-Id 同源，实际: %s / %s", traceID, reqChat.Header.Get("X-Trace-Id"))
+	}
+	for _, r := range traceID {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			t.Fatalf("对话头 x_trace_id 应为纯十六进制随机串（不得携带明文工具标识），实际: %s", traceID)
+		}
 	}
 	if reqChat.Header.Get("X-Auth-Sign") != "" {
 		t.Fatalf("对话头不应混入 UserAPI 签名头")
@@ -127,6 +133,48 @@ func TestPrepareOutboundChatBodyNoSystemAndNoMaxTokens(t *testing.T) {
 	first := msgs[0].(map[string]any)
 	if first["role"] != "system" || first["content"] != SystemIdentityPrefix {
 		t.Fatalf("插入的首条 system 消息内容不符: %+v", first)
+	}
+}
+
+func TestPrepareOutboundChatBodyStreamUsage(t *testing.T) {
+	// 流式请求默认补齐 stream_options.include_usage，确保客户端能拿到末尾完整 usage
+	outBytes := PrepareOutboundChatBody([]byte(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`), "m")
+	var out map[string]any
+	_ = json.Unmarshal(outBytes, &out)
+	opts, ok := out["stream_options"].(map[string]any)
+	if !ok || opts["include_usage"] != true {
+		t.Fatalf("stream:true 应默认补齐 stream_options.include_usage=true，实际: %v", out["stream_options"])
+	}
+
+	// 客户端已显式携带 stream_options 时不覆盖其原值
+	outBytes2 := PrepareOutboundChatBody([]byte(`{"stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}`), "m")
+	var out2 map[string]any
+	_ = json.Unmarshal(outBytes2, &out2)
+	opts2, _ := out2["stream_options"].(map[string]any)
+	if opts2 == nil || opts2["include_usage"] != false {
+		t.Fatalf("客户端显式 include_usage=false 不应被覆盖，实际: %v", out2["stream_options"])
+	}
+
+	// 非流式请求不注入
+	outBytes3 := PrepareOutboundChatBody([]byte(`{"stream":false,"messages":[{"role":"user","content":"hi"}]}`), "m")
+	var out3 map[string]any
+	_ = json.Unmarshal(outBytes3, &out3)
+	if _, exists := out3["stream_options"]; exists {
+		t.Fatalf("非流式请求不应注入 stream_options")
+	}
+}
+
+func TestExplainOAuthExchangeBizError(t *testing.T) {
+	msg := explainOAuthExchangeBizError(630014, "抱歉,审核失败,请重新尝试")
+	if !strings.Contains(msg, "换票阶段") || !strings.Contains(msg, "code=630014") || !strings.Contains(msg, "审核失败") {
+		t.Fatalf("换票阶段 630014 应明确提示换票风控并保留原始 code/msg，实际: %s", msg)
+	}
+	if strings.Contains(msg, "人机验证未通过") {
+		t.Fatalf("换票阶段不得复用第一步滑块错误文案: %s", msg)
+	}
+	plain := explainOAuthExchangeBizError(999999, "some upstream message")
+	if !strings.Contains(plain, "code=999999") || !strings.Contains(plain, "some upstream message") {
+		t.Fatalf("未知业务码应保留上游原始 code/msg，实际: %s", plain)
 	}
 }
 

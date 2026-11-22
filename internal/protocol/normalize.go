@@ -64,7 +64,9 @@ var promptSanitizeRules = []identityRewriteRule{
 //  1. 按路由结果覆盖 model，并删除上游不接受的 user 字段；
 //  2. 将所有 system / developer 消息中的外来客户端身份句替换为中性描述；
 //  3. 确保首条消息为 system 且内容以 SystemIdentityPrefix 开头（幂等不重复拼接）；
-//  4. 若显式传入小于 10000 的正整数 max_tokens，则自动抬升至 10000；未传时不注入，不改动 max_completion_tokens。
+//  4. 若显式传入小于 10000 的正整数 max_tokens，则自动抬升至 10000；未传时不注入，不改动 max_completion_tokens；
+//  5. 流式请求默认补齐 stream_options.include_usage = true，确保客户端能拿到流式末尾的完整
+//     usage（含 prompt/completion tokens 与缓存命中统计）；客户端已显式携带 stream_options 时不覆盖其原值。
 func PrepareOutboundChatBody(rawBody []byte, targetModel string) []byte {
 	if len(rawBody) == 0 {
 		return rawBody
@@ -81,12 +83,29 @@ func PrepareOutboundChatBody(rawBody []byte, targetModel string) []byte {
 
 	normalizeMessagesForUpstream(payload)
 	normalizeMaxTokensFloor(payload)
+	normalizeStreamUsage(payload)
 
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return rawBody
 	}
 	return encoded
+}
+
+// normalizeStreamUsage 对 stream: true 的请求默认补齐 stream_options.include_usage = true。
+func normalizeStreamUsage(payload map[string]any) {
+	stream, _ := payload["stream"].(bool)
+	if !stream {
+		return
+	}
+	switch opts := payload["stream_options"].(type) {
+	case map[string]any:
+		if _, ok := opts["include_usage"]; !ok {
+			opts["include_usage"] = true
+		}
+	default:
+		payload["stream_options"] = map[string]any{"include_usage": true}
+	}
 }
 
 func normalizeMessagesForUpstream(payload map[string]any) {

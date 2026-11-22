@@ -267,6 +267,29 @@ func (p *Pool) Acquire(region protocol.Region, exclude map[string]bool) (*Accoun
 	return &snap, true
 }
 
+// AcquireSpecific 优先获取指定的账号（供会话粘性调度使用），仅当该账号存在、
+// 属于目标区域、未被排除且处于在线就绪状态时成功；语义与 Acquire 一致（计数请求并返回快照）。
+func (p *Pool) AcquireSpecific(region protocol.Region, id string, exclude map[string]bool) (*Account, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if exclude != nil && exclude[id] {
+		return nil, false
+	}
+	acc, ok := p.items[id]
+	if !ok {
+		return nil, false
+	}
+	if region != "" && acc.Cred.Region != region {
+		return nil, false
+	}
+	if acc.EffectiveStatus(time.Now()) != StatusOnline {
+		return nil, false
+	}
+	acc.TotalRequests++
+	snap := *acc
+	return &snap, true
+}
+
 // ReportSuccess 标记账号本次调用成功，清理残余错误状态。
 func (p *Pool) ReportSuccess(id string) {
 	p.mu.Lock()

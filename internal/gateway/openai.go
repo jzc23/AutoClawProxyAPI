@@ -177,6 +177,8 @@ func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, body io.Reader, 
 }
 
 // executeChatWithFailover 执行带指数退避与自动切号故障转移的非流式对话请求。
+// 同一会话在 15 分钟内优先粘性复用上次成功的账号以提升上游 Prompt Cache 命中率，
+// 遇限流/积分不足/失效切号时自动改绑新账号。
 func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel string, chatBody []byte) ([]byte, *accounts.Account, error) {
 	targets, err := s.router.ResolveTargets(requestedModel)
 	if err != nil {
@@ -186,6 +188,7 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 			Message:    err.Error(),
 		}
 	}
+	stickyKey := sessionKeyForChatBody(requestedModel, chatBody)
 
 	retryCfg := s.cfgMgr.Get().Retry
 	maxAttempts := max(1, retryCfg.MaxRetries+1)
@@ -193,7 +196,7 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 	var lastErr error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		acc, target, ok := s.pickNextAccount(targets, triedAccounts)
+		acc, target, ok := s.pickNextAccountSticky(targets, triedAccounts, stickyKey)
 		if !ok {
 			if lastErr != nil {
 				return nil, nil, lastErr
@@ -227,6 +230,7 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 		})
 		if errCall == nil {
 			s.pool.ReportSuccess(acc.ID)
+			s.sticky.bind(stickyKey, acc.ID, target.Region)
 			return respBytes, acc, nil
 		}
 
@@ -243,6 +247,8 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 			}
 			// 还有候选账号可切号时，限流/积分不足/失效立即切号；仅在瞬态网络错误或重试时短暂退避
 			if attempt+1 < maxAttempts {
+				// 粘性账号触发限流/积分不足/失效：解除绑定，本次成功后改绑新账号
+				s.sticky.unbind(stickyKey)
 				if uerr.Kind == protocol.ErrorKindTransient {
 					if !sleepWithContext(ctx, calcBackoff(attempt, retryCfg, uerr.RetryAfter)) {
 						return nil, nil, ctx.Err()
@@ -257,6 +263,8 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 }
 
 // executeChatStreamWithFailover 执行带自动切号故障转移的流式 SSE 请求。
+// 同一会话在 15 分钟内优先粘性复用上次成功的账号以提升上游 Prompt Cache 命中率，
+// 遇限流/积分不足/失效切号时自动改绑新账号。
 func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedModel string, chatBody []byte) (*http.Response, *accounts.Account, error) {
 	targets, err := s.router.ResolveTargets(requestedModel)
 	if err != nil {
@@ -266,6 +274,7 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 			Message:    err.Error(),
 		}
 	}
+	stickyKey := sessionKeyForChatBody(requestedModel, chatBody)
 
 	retryCfg := s.cfgMgr.Get().Retry
 	maxAttempts := max(1, retryCfg.MaxRetries+1)
@@ -273,7 +282,7 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 	var lastErr error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		acc, target, ok := s.pickNextAccount(targets, triedAccounts)
+		acc, target, ok := s.pickNextAccountSticky(targets, triedAccounts, stickyKey)
 		if !ok {
 			if lastErr != nil {
 				return nil, nil, lastErr
@@ -307,6 +316,7 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 		})
 		if errCall == nil {
 			s.pool.ReportSuccess(acc.ID)
+			s.sticky.bind(stickyKey, acc.ID, target.Region)
 			return resp, acc, nil
 		}
 
@@ -322,6 +332,8 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 				return nil, nil, uerr
 			}
 			if attempt+1 < maxAttempts {
+				// 粘性账号触发限流/积分不足/失效：解除绑定，本次成功后改绑新账号
+				s.sticky.unbind(stickyKey)
 				if uerr.Kind == protocol.ErrorKindTransient {
 					if !sleepWithContext(ctx, calcBackoff(attempt, retryCfg, uerr.RetryAfter)) {
 						return nil, nil, ctx.Err()
@@ -342,6 +354,24 @@ func (s *Server) pickNextAccount(targets []accounts.RouteTarget, exclude map[str
 		}
 	}
 	return nil, accounts.RouteTarget{}, false
+}
+
+// pickNextAccountSticky 在候选目标上优先复用会话粘性绑定的账号；绑定账号已不可用
+// （冷却/失效/被排除）时回落常规轮询调度。返回的 target 始终与实际使用的账号区域一致。
+func (s *Server) pickNextAccountSticky(targets []accounts.RouteTarget, exclude map[string]bool, stickyKey string) (*accounts.Account, accounts.RouteTarget, bool) {
+	if stickyKey != "" {
+		accID, _, bound := s.sticky.lookup(stickyKey)
+		if bound {
+			for _, target := range targets {
+				if acc, ok := s.pool.AcquireSpecific(target.Region, accID, exclude); ok {
+					return acc, target, true
+				}
+			}
+			// 粘性账号已不在线或不属于候选区域：解除失效绑定，回落轮询
+			s.sticky.unbind(stickyKey)
+		}
+	}
+	return s.pickNextAccount(targets, exclude)
 }
 
 // scanSSEData 逐行读取上游 SSE 数据流并回调每条 data 载荷。
