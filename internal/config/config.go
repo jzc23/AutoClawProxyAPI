@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -18,7 +19,9 @@ import (
 // Version 声明当前程序版本号。
 // v1.0.1: 修复国际版令牌续期阈值/换票报错/签到重复触发/模型目录闪断，移除 x_trace_id 明文标识；
 // 新增会话粘性调度（Prompt Cache 优化）、后台余额定时刷新与流式 usage 默认回传。
-const Version = "v1.0.1"
+// v1.0.2: 修复限流误判长冷却与 403 误判会话死亡，onclick 注入加固，面板登录防爆破，
+// 密码哈希升级 PBKDF2，vKey 生成消除模偏差，启动免鉴权告警与流式响应头超时。
+const Version = "v1.0.2"
 
 // PanelAuth 保存 Web 控制台登录密码的安全哈希（不存明文）。
 type PanelAuth struct {
@@ -30,7 +33,15 @@ func (p PanelAuth) Initialized() bool {
 	return strings.TrimSpace(p.PasswordHash) != ""
 }
 
-// HashPanelPassword 使用随机盐与 SHA-256 生成面板密码存储哈希。
+// PBKDF2-SHA256 迭代轮数（OWASP 2023 推荐值），兼顾登录延迟与离线爆破成本。
+const pbkdf2Iterations = 210000
+
+// IsPBKDF2Hash 判断存储哈希是否已是 PBKDF2 新格式（v1.0.2 起生成，旧版为单轮 SHA-256）。
+func IsPBKDF2Hash(storedHash string) bool {
+	return strings.HasPrefix(strings.TrimSpace(storedHash), "pbkdf2-sha256$")
+}
+
+// HashPanelPassword 使用 PBKDF2-SHA256（21 万轮 + 随机盐）生成面板密码存储哈希。
 func HashPanelPassword(plain string) (string, error) {
 	if len(strings.TrimSpace(plain)) < 4 {
 		return "", errors.New("面板密码长度不能少于 4 位")
@@ -39,17 +50,45 @@ func HashPanelPassword(plain string) (string, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("生成密码盐值失败: %w", err)
 	}
-	saltHex := hex.EncodeToString(salt)
-	sum := sha256.Sum256([]byte(saltHex + ":" + plain))
-	return saltHex + "$" + hex.EncodeToString(sum[:]), nil
+	key, err := pbkdf2.Key(sha256.New, plain, salt, pbkdf2Iterations, 32)
+	if err != nil {
+		return "", fmt.Errorf("计算密码哈希失败: %w", err)
+	}
+	return fmt.Sprintf("pbkdf2-sha256$%d$%s$%s", pbkdf2Iterations, hex.EncodeToString(salt), hex.EncodeToString(key)), nil
 }
 
-// VerifyPanelPassword 使用常量时间比较校验明文密码与哈希是否一致。
+// VerifyPanelPassword 校验明文密码与存储哈希是否一致，兼容 v1.0.1 及更早的
+// 单轮 SHA-256 旧格式（salt$hash）；使用常量时间比较防止时序侧信道。
 func VerifyPanelPassword(plain, storedHash string) bool {
 	storedHash = strings.TrimSpace(storedHash)
 	if storedHash == "" || plain == "" {
 		return false
 	}
+	if IsPBKDF2Hash(storedHash) {
+		parts := strings.Split(storedHash, "$")
+		if len(parts) != 4 {
+			return false
+		}
+		iter := 0
+		if _, err := fmt.Sscanf(parts[1], "%d", &iter); err != nil || iter <= 0 || iter > 10_000_000 {
+			return false
+		}
+		salt, errSalt := hex.DecodeString(parts[2])
+		if errSalt != nil || len(salt) == 0 {
+			return false
+		}
+		want, errWant := hex.DecodeString(parts[3])
+		if errWant != nil || len(want) == 0 {
+			return false
+		}
+		got, err := pbkdf2.Key(sha256.New, plain, salt, iter, len(want))
+		if err != nil {
+			return false
+		}
+		return subtle.ConstantTimeCompare(got, want) == 1
+	}
+
+	// 旧格式：salt$hash，hash = SHA256(salt + ":" + plain)
 	parts := strings.SplitN(storedHash, "$", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return false
@@ -71,15 +110,25 @@ type APIKeyItem struct {
 const vKeyAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 // GenerateVKey 随机生成以 "vKey-" 开头的网关访问密钥。
+// 采用拒绝采样（丢弃 >= 4*62 的字节）保证 62 个字符等概率，消除取模偏差。
 func GenerateVKey() string {
 	const bodyLen = 28
-	buf := make([]byte, bodyLen)
-	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("vKey-%x", time.Now().UnixNano())
-	}
-	out := make([]byte, bodyLen)
-	for i, b := range buf {
-		out[i] = vKeyAlphabet[int(b)%len(vKeyAlphabet)]
+	const alphabetLen = len(vKeyAlphabet)        // 62
+	const unbiasedMax = 256 - (256 % alphabetLen) // 248，小于该值的字节均匀映射到字母表
+	out := make([]byte, 0, bodyLen)
+	buf := make([]byte, 64)
+	for len(out) < bodyLen {
+		if _, err := rand.Read(buf); err != nil {
+			return fmt.Sprintf("vKey-%x", time.Now().UnixNano())
+		}
+		for _, b := range buf {
+			if int(b) < unbiasedMax {
+				out = append(out, vKeyAlphabet[int(b)%alphabetLen])
+				if len(out) == bodyLen {
+					break
+				}
+			}
+		}
 	}
 	return "vKey-" + string(out)
 }

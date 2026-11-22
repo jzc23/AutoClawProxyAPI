@@ -872,14 +872,18 @@ func buildDirectTransport() *http.Transport {
 		KeepAlive: 30 * time.Second,
 	}
 	return &http.Transport{
-		DialContext:           d.DialContext,
-		Proxy:                 nil,
+		DialContext: d.DialContext,
+		// 尊重 HTTP_PROXY/HTTPS_PROXY/NO_PROXY 环境变量（未设置时行为与直连完全一致），
+		// 便于强制出站流量的内网/NAS 部署场景
+		Proxy:                 http.ProxyFromEnvironment,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          128,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		// 长时间建连但不返回响应头时快速失败（不影响后续流式读取）；流式与非流式共用该上限
+		ResponseHeaderTimeout: 5 * time.Minute,
 	}
 }
 
@@ -900,6 +904,8 @@ func buildProxyTransport(rawURL string) (*http.Transport, error) {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		// 与直连保持一致：5 分钟内未返回响应头即判失败，进入切号/退避
+		ResponseHeaderTimeout: 5 * time.Minute,
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https":

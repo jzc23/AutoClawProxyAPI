@@ -20,6 +20,11 @@ func ResponsesToOpenAIRequest(raw []byte) (outBody []byte, model string, stream 
 	model = strings.TrimSpace(model)
 	stream, _ = req["stream"].(bool)
 
+	// 网关无会话存储，previous_response_id 有状态用法会静默丢失上下文，明确报错比静默丢弃更安全
+	if prevID, ok := req["previous_response_id"].(string); ok && strings.TrimSpace(prevID) != "" {
+		return nil, "", false, fmt.Errorf("本网关为无状态代理，暂不支持 previous_response_id 有状态用法；请在 input 中携带完整历史（store:false 无状态模式）")
+	}
+
 	messages := make([]map[string]any, 0, 8)
 
 	// 1. instructions -> system

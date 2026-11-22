@@ -42,6 +42,8 @@ type Server struct {
 	sessionMu     sync.RWMutex
 	panelSessions map[string]panelSession
 
+	loginGuard *panelLoginGuard
+
 	sticky *stickyTable
 }
 
@@ -64,6 +66,7 @@ func NewServer(
 		startedAt:     time.Now(),
 		oauthSessions: make(map[string]oauthSession),
 		panelSessions: make(map[string]panelSession),
+		loginGuard:    &panelLoginGuard{},
 		sticky:        newStickyTable(),
 	}
 }

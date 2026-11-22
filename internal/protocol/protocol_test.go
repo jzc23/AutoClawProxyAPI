@@ -178,6 +178,33 @@ func TestExplainOAuthExchangeBizError(t *testing.T) {
 	}
 }
 
+func TestClassifyErrorRateLimitVsCreditAnd403(t *testing.T) {
+	// 429 + "rate limit reached" 文案：必须先按 429 判软限流短冷却，
+	// 而不是命中 hard_credit 的 "limit reached" 短语导致长冷却
+	e := ClassifyError(429, 0, `{"error":"rate limit reached, please retry"}`, 0)
+	if e.Kind != ErrorKindSoftRate {
+		t.Fatalf("429 应归类 soft_rate，实际: %s", e.Kind)
+	}
+	// 配额文案（无 429 状态）仍判积分不足
+	e2 := ClassifyError(200, 0, "usage limit exceeded for this account", 0)
+	if e2.Kind != ErrorKindHardCredit {
+		t.Fatalf("配额文案应归类 hard_credit，实际: %s", e2.Kind)
+	}
+	// 403 风控/WAF：中等冷却并切号，不再判会话死亡
+	e3 := ClassifyError(403, 0, "forbidden", 0)
+	if e3.Kind != ErrorKindRiskControl {
+		t.Fatalf("403 应归类 risk_control，实际: %s", e3.Kind)
+	}
+	if !e3.ShouldFailover() {
+		t.Fatal("risk_control 应触发切号")
+	}
+	// 401 仍判会话失效
+	e4 := ClassifyError(401, 0, "unauthorized", 0)
+	if e4.Kind != ErrorKindSessionDead {
+		t.Fatalf("401 应归类 session_dead，实际: %s", e4.Kind)
+	}
+}
+
 func TestClassifyErrorLevels(t *testing.T) {
 	e1 := ClassifyError(200, 410000, "not logged in", 0)
 	if e1.Kind != ErrorKindSessionDead {

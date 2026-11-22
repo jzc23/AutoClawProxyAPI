@@ -1109,6 +1109,12 @@ function esc(s){
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// jsAttr 用于 onclick="foo('${jsAttr(x)}')" 场景：属性内是 JS 字符串上下文，
+// 必须转义反斜杠与单引号（esc 只防 HTML 注入，防不了 JS 字面量断裂）。
+function jsAttr(s){
+  return String(s ?? '').replace(/\\/g,'\\\\').replace(/'/g,'\\u0027').replace(/</g,'\\u003c');
+}
+
 function toast(msg, isErr){
   const el = document.getElementById('toast');
   el.textContent = msg;
@@ -1372,13 +1378,13 @@ async function loadAccounts(){
         <td>${ci}</td>
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap">
-            <button class="btn sm" onclick="openAccProxyModal('${esc(a.id)}')">代理</button>
-            <button class="btn sm" onclick="openEditModal('${esc(a.id)}')">别名</button>
-            <button class="btn sm" onclick="toggleAccount('${esc(a.id)}', ${!a.disabled})">${a.disabled ? '启用' : '停用'}</button>
-            <button class="btn sm" onclick="refreshOneBalance('${esc(a.id)}')">余额</button>
-            <button class="btn sm" onclick="refreshOneToken('${esc(a.id)}')">续期</button>
-            <button class="btn sm" onclick="checkinOne('${esc(a.id)}')">签到</button>
-            <button class="btn sm danger" onclick="deleteAccount('${esc(a.id)}')">删除</button>
+            <button class="btn sm" onclick="openAccProxyModal('${jsAttr(a.id)}')">代理</button>
+            <button class="btn sm" onclick="openEditModal('${jsAttr(a.id)}')">别名</button>
+            <button class="btn sm" onclick="toggleAccount('${jsAttr(a.id)}', ${!a.disabled})">${a.disabled ? '启用' : '停用'}</button>
+            <button class="btn sm" onclick="refreshOneBalance('${jsAttr(a.id)}')">余额</button>
+            <button class="btn sm" onclick="refreshOneToken('${jsAttr(a.id)}')">续期</button>
+            <button class="btn sm" onclick="checkinOne('${jsAttr(a.id)}')">签到</button>
+            <button class="btn sm danger" onclick="deleteAccount('${jsAttr(a.id)}')">删除</button>
           </div>
         </td>
       </tr>`;
@@ -1505,10 +1511,10 @@ async function loadProxies(){
         <td>${esc(boundLabel)}</td>
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap">
-            <button class="btn sm" onclick="probeOneProxy('${esc(n.id)}')">测活</button>
-            <button class="btn sm" onclick="openProxyEditModal('${esc(n.id)}')">编辑</button>
-            <button class="btn sm" onclick="toggleProxyEnabled('${esc(n.id)}', ${!n.enabled})">${n.enabled ? '停用' : '启用'}</button>
-            <button class="btn sm danger" onclick="deleteProxyNode('${esc(n.id)}')">删除</button>
+            <button class="btn sm" onclick="probeOneProxy('${jsAttr(n.id)}')">测活</button>
+            <button class="btn sm" onclick="openProxyEditModal('${jsAttr(n.id)}')">编辑</button>
+            <button class="btn sm" onclick="toggleProxyEnabled('${jsAttr(n.id)}', ${!n.enabled})">${n.enabled ? '停用' : '启用'}</button>
+            <button class="btn sm danger" onclick="deleteProxyNode('${jsAttr(n.id)}')">删除</button>
           </div>
         </td>
       </tr>`;
@@ -1685,15 +1691,15 @@ async function loadAPIKeys(){
         <td class="hl">${esc(k.name)}</td>
         <td>
           <span class="mono-key">${esc(k.key)}</span>
-          <button class="btn sm" style="margin-left:6px" onclick="copyText('${esc(k.key)}')">复制</button>
+          <button class="btn sm" style="margin-left:6px" onclick="copyText('${jsAttr(k.key)}')">复制</button>
         </td>
         <td>${st}</td>
         <td class="dim">${esc(k.created_at)}</td>
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap">
-            <button class="btn sm" onclick="renameVKey('${esc(k.id)}', '${esc(k.name)}')">改名</button>
-            <button class="btn sm" onclick="toggleVKey('${esc(k.id)}', ${!k.enabled})">${k.enabled ? '停用' : '启用'}</button>
-            <button class="btn sm danger" onclick="deleteVKey('${esc(k.id)}')">删除</button>
+            <button class="btn sm" onclick="renameVKey('${jsAttr(k.id)}', '${jsAttr(k.name)}')">改名</button>
+            <button class="btn sm" onclick="toggleVKey('${jsAttr(k.id)}', ${!k.enabled})">${k.enabled ? '停用' : '启用'}</button>
+            <button class="btn sm danger" onclick="deleteVKey('${jsAttr(k.id)}')">删除</button>
           </div>
         </td>
       </tr>`;
@@ -1836,7 +1842,7 @@ async function loadModels(){
         <td>${m.context_window ? Math.round(m.context_window/1000) + 'K' : '—'}</td>
         <td class="dim">${feats}</td>
         <td>${st}</td>
-        <td><button class="btn sm" onclick="toggleModelDisabled('${esc(m.id)}', ${!m.disabled})">${m.disabled ? '启用' : '禁用'}</button></td>
+        <td><button class="btn sm" onclick="toggleModelDisabled('${jsAttr(m.id)}', ${!m.disabled})">${m.disabled ? '启用' : '禁用'}</button></td>
       </tr>`;
     }).join('');
   } catch(e){ if (!String(e.message).includes('登录')) toast('加载模型目录失败: ' + e.message, true); }
@@ -1851,7 +1857,7 @@ function renderAliases(){
     ${entries.map(([k,v]) => `<tr>
       <td class="hl">${esc(k)}</td>
       <td>${esc((v||[]).join(', '))}</td>
-      <td><button class="btn sm danger" onclick="deleteAlias('${esc(k)}')">删除</button></td>
+      <td><button class="btn sm danger" onclick="deleteAlias('${jsAttr(k)}')">删除</button></td>
     </tr>`).join('')}
   </table>`;
 }

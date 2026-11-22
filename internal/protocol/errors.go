@@ -16,6 +16,7 @@ const (
 	ErrorKindSessionDead ErrorKind = "session_dead" // 账号会话失效（410000/400000/登录过期）→ 暂停调度
 	ErrorKindHardCredit  ErrorKind = "hard_credit"  // 积分或余额不足（HTTP 402/配额文案）→ 长冷却并切号
 	ErrorKindSoftRate    ErrorKind = "soft_rate"    // 触发限流（HTTP 429）→ 短冷却并切号
+	ErrorKindRiskControl ErrorKind = "risk_control" // HTTP 403 风控/WAF 拦截 → 中等冷却并切号（不判会话死亡）
 	ErrorKindTransient   ErrorKind = "transient"    // 网络异常、超时或 5xx → 可退避重试与切号
 	ErrorKindClient      ErrorKind = "client"       // 4xx 参数错误等 → 直接返回客户端
 )
@@ -42,7 +43,7 @@ func (e *UpstreamError) Error() string {
 // ShouldFailover 判断该错误是否应当切换其他可用账号重试。
 func (e *UpstreamError) ShouldFailover() bool {
 	switch e.Kind {
-	case ErrorKindSessionDead, ErrorKindHardCredit, ErrorKindSoftRate, ErrorKindTransient:
+	case ErrorKindSessionDead, ErrorKindHardCredit, ErrorKindSoftRate, ErrorKindRiskControl, ErrorKindTransient:
 		return true
 	default:
 		return false
@@ -62,6 +63,16 @@ type errorPhraseRule struct {
 }
 
 var errorClassifierTable = []errorPhraseRule{
+	// 软限流规则必须排在 hard_credit 之前：避免 "rate limit reached" 等限流文案
+	// 命中 hard_credit 的 "limit reached" 短语，导致账号被错误地长冷却 30 分钟。
+	{
+		kind:       ErrorKindSoftRate,
+		httpStatus: http.StatusTooManyRequests,
+		phrases: []string{
+			"rate limit", "too many requests", "throttl", "qps exceed",
+			"请求过于频繁", "限流", "触发流控", "请求太快",
+		},
+	},
 	{
 		kind:       ErrorKindHardCredit,
 		httpStatus: http.StatusPaymentRequired,
@@ -116,6 +127,17 @@ func ClassifyError(httpStatus int, bizCode int64, body string, retryAfter time.D
 		}
 	}
 
+	// HTTP 429 语义明确：无论响应体文案如何，一律按软限流短冷却处理，先于短语匹配
+	if httpStatus == http.StatusTooManyRequests {
+		return &UpstreamError{
+			HTTPStatus: httpStatus,
+			BizCode:    bizCode,
+			Kind:       ErrorKindSoftRate,
+			Message:    msg,
+			RetryAfter: retryAfter,
+		}
+	}
+
 	lower := strings.ToLower(body)
 	for _, rule := range errorClassifierTable {
 		for _, phrase := range rule.phrases {
@@ -132,11 +154,20 @@ func ClassifyError(httpStatus int, bizCode int64, body string, retryAfter time.D
 	}
 
 	switch {
-	case httpStatus == http.StatusUnauthorized || httpStatus == http.StatusForbidden:
+	case httpStatus == http.StatusUnauthorized:
 		return &UpstreamError{
 			HTTPStatus: httpStatus,
 			BizCode:    bizCode,
 			Kind:       ErrorKindSessionDead,
+			Message:    msg,
+			RetryAfter: retryAfter,
+		}
+	case httpStatus == http.StatusForbidden:
+		// 403 多为 WAF/风控拦截（与 IP/指纹相关），令牌本身仍有效：中等冷却并切号，不判会话死亡
+		return &UpstreamError{
+			HTTPStatus: httpStatus,
+			BizCode:    bizCode,
+			Kind:       ErrorKindRiskControl,
 			Message:    msg,
 			RetryAfter: retryAfter,
 		}
@@ -145,14 +176,6 @@ func ClassifyError(httpStatus int, bizCode int64, body string, retryAfter time.D
 			HTTPStatus: httpStatus,
 			BizCode:    bizCode,
 			Kind:       ErrorKindHardCredit,
-			Message:    msg,
-			RetryAfter: retryAfter,
-		}
-	case httpStatus == http.StatusTooManyRequests:
-		return &UpstreamError{
-			HTTPStatus: httpStatus,
-			BizCode:    bizCode,
-			Kind:       ErrorKindSoftRate,
 			Message:    msg,
 			RetryAfter: retryAfter,
 		}

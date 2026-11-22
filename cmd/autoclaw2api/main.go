@@ -90,6 +90,10 @@ func main() {
 		protocol.ResolveBaseURL(protocol.RegionCN, cfg.Upstream.CNBaseURL),
 		protocol.ResolveBaseURL(protocol.RegionGlobal, cfg.Upstream.GlobalBaseURL))
 	logger.Info("Startup", "Web 控制台: http://localhost:%s | OpenAI: /v1/chat/completions | Responses: /v1/responses | Anthropic: /v1/messages", port)
+	if len(cfg.APIKeys) == 0 {
+		logger.Warn("Startup", "⚠️ 尚未创建任何网关 API Key，/v1/* 接口当前完全放行（免鉴权模式）。"+
+			"公网部署请务必在控制台「API 密钥」页创建密钥，否则任何人都能消耗账号积分！")
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

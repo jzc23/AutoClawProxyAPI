@@ -148,12 +148,14 @@ func (e *Engine) History(limit int) []CheckinRecord {
 
 // Start 启动后台定时调度协程。
 func (e *Engine) Start(ctx context.Context) {
-	// 启动后异步预热：实时同步双区模型目录并拉取一次余额
+	// 启动后异步预热：模型目录与余额各自限时，避免其中一个耗尽超时预算拖垮另一个
 	go func() {
-		warmupCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		defer cancel()
-		_ = e.router.RefreshAllModels(warmupCtx)
-		e.RefreshAllBalances(warmupCtx)
+		modelsCtx, cancelModels := context.WithTimeout(ctx, 45*time.Second)
+		_ = e.router.RefreshAllModels(modelsCtx)
+		cancelModels()
+		balanceCtx, cancelBalance := context.WithTimeout(ctx, 60*time.Second)
+		e.RefreshAllBalances(balanceCtx)
+		cancelBalance()
 	}()
 
 	go func() {
@@ -222,7 +224,22 @@ func (e *Engine) maybeRunDailyCheckin(ctx context.Context) {
 
 func (e *Engine) refreshExpiringTokens(ctx context.Context) {
 	now := time.Now().Unix()
-	for _, acc := range e.pool.AllAccounts() {
+	all := e.pool.AllAccounts()
+
+	// 清理已不存在账号的退避记录，避免 map 随账号增删缓慢膨胀
+	valid := make(map[string]struct{}, len(all))
+	for _, acc := range all {
+		valid[acc.ID] = struct{}{}
+	}
+	e.mu.Lock()
+	for id := range e.refreshFails {
+		if _, ok := valid[id]; !ok {
+			delete(e.refreshFails, id)
+		}
+	}
+	e.mu.Unlock()
+
+	for _, acc := range all {
 		if acc.Cred.Disabled || acc.Cred.RefreshToken == "" {
 			continue
 		}

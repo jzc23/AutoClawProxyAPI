@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"autoclaw2api/internal/config"
@@ -15,10 +16,47 @@ import (
 const (
 	panelSessionCookie = "ac2a_panel_session"
 	panelSessionTTL    = 7 * 24 * time.Hour
+
+	// 面板登录防爆破：连续失败 5 次锁定 5 分钟（内存态，重启即清零）。
+	panelLoginMaxFails   = 5
+	panelLoginLockWindow = 5 * time.Minute
 )
 
 type panelSession struct {
 	ExpiresAt time.Time
+}
+
+// panelLoginGuard 内存态登录失败计数器与临时锁定。
+type panelLoginGuard struct {
+	mu          sync.Mutex
+	fails       int
+	lockedUntil time.Time
+}
+
+func (g *panelLoginGuard) allow() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return time.Now().After(g.lockedUntil)
+}
+
+// recordFail 记录一次失败；达到阈值时进入锁定并返回锁定时长（0 表示未触发锁定）。
+func (g *panelLoginGuard) recordFail() time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fails++
+	if g.fails >= panelLoginMaxFails {
+		g.lockedUntil = time.Now().Add(panelLoginLockWindow)
+		g.fails = 0
+		return panelLoginLockWindow
+	}
+	return 0
+}
+
+func (g *panelLoginGuard) reset() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fails = 0
+	g.lockedUntil = time.Time{}
 }
 
 func (s *Server) newPanelSession() string {
@@ -183,10 +221,38 @@ func (s *Server) handlePanelAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求参数解析失败"})
 		return
 	}
+	if !s.loginGuard.allow() {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error": fmt.Sprintf("面板密码连续错误次数过多，已临时锁定，请 %.0f 分钟后再试", panelLoginLockWindow.Minutes()),
+		})
+		return
+	}
 	if !config.VerifyPanelPassword(body.Password, cfg.PanelAuth.PasswordHash) {
+		if lockFor := s.loginGuard.recordFail(); lockFor > 0 {
+			if s.logger != nil {
+				s.logger.Warn("Auth", "面板密码连续 %d 次校验失败，已临时锁定 %.0f 分钟", panelLoginMaxFails, lockFor.Minutes())
+			}
+		} else if s.logger != nil {
+			s.logger.Warn("Auth", "面板密码校验失败（来自 %s）", r.RemoteAddr)
+		}
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "面板密码不正确，请重试"})
 		return
 	}
+	s.loginGuard.reset()
+
+	// 旧版单轮 SHA-256 哈希在登录成功后透明升级为 PBKDF2，无需用户操作
+	if !config.IsPBKDF2Hash(cfg.PanelAuth.PasswordHash) {
+		if newHash, err := config.HashPanelPassword(body.Password); err == nil {
+			_, _ = s.cfgMgr.Update(func(c *config.Config) error {
+				c.PanelAuth.PasswordHash = newHash
+				return nil
+			})
+			if s.logger != nil {
+				s.logger.Info("Auth", "面板密码存储已从单轮 SHA-256 自动升级为 PBKDF2-SHA256")
+			}
+		}
+	}
+
 	token := s.newPanelSession()
 	setPanelSessionCookie(w, token)
 	if s.logger != nil {

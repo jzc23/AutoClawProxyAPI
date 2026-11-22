@@ -329,6 +329,14 @@ func (p *Pool) ReportError(id string, uerr *protocol.UpstreamError) {
 		}
 		acc.CooldownUntil = now.Add(dur)
 		acc.CooldownKind = "hard_credit"
+	case protocol.ErrorKindRiskControl:
+		// 风控/WAF 拦截与 IP 指纹相关：中等冷却（短冷却 × 10，默认 10 分钟），不判会话死亡
+		dur := time.Duration(retryCfg.ShortCooldownSec*10) * time.Second
+		if uerr.RetryAfter > dur {
+			dur = uerr.RetryAfter
+		}
+		acc.CooldownUntil = now.Add(dur)
+		acc.CooldownKind = "risk_control"
 	case protocol.ErrorKindSoftRate:
 		dur := time.Duration(retryCfg.ShortCooldownSec) * time.Second
 		if uerr.RetryAfter > 0 {
