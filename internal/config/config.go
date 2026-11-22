@@ -21,7 +21,10 @@ import (
 // 新增会话粘性调度（Prompt Cache 优化）、后台余额定时刷新与流式 usage 默认回传。
 // v1.0.2: 修复限流误判长冷却与 403 误判会话死亡，onclick 注入加固，面板登录防爆破，
 // 密码哈希升级 PBKDF2，vKey 生成消除模偏差，启动免鉴权告警与流式响应头超时。
-const Version = "v1.0.2"
+// v1.0.3: 非流式请求上游侧改为内部流式聚合（已在 v1.0.4 撤回）。
+// v1.0.4: 非流式空白心跳保活——RFC 8259 允许 JSON 值前有空白，长生成期间周期性写出
+// 空格并 flush，持续重置反向代理/Cloudflare 的读超时，传输不再被切断返回 504。
+const Version = "v1.0.4"
 
 // PanelAuth 保存 Web 控制台登录密码的安全哈希（不存明文）。
 type PanelAuth struct {

@@ -72,14 +72,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 非流式：启用空白心跳保活，长生成期间持续重置反向代理/Cloudflare 的读超时，避免连接被切断返回 504
+	ka := startNonStreamKeepalive(w)
 	payload, _, err := s.executeChatWithFailover(r.Context(), meta.Model, rawBody)
 	if err != nil {
+		if stopAndReportError(w, ka, "openai", err) {
+			return
+		}
 		writeOpenAIUpstreamError(w, err)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(payload)
+	finishNonStreamKeepalive(w, ka, http.StatusOK, payload)
 }
 
 // handleResponses 实现 OpenAI 兼容的 POST /v1/responses（含非流式与流式事件转换）。
@@ -136,19 +139,25 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 非流式：启用空白心跳保活，长生成期间持续重置反向代理/Cloudflare 的读超时，避免连接被切断返回 504
+	ka := startNonStreamKeepalive(w)
 	payload, _, err := s.executeChatWithFailover(r.Context(), model, chatBody)
 	if err != nil {
+		if stopAndReportError(w, ka, "openai", err) {
+			return
+		}
 		writeOpenAIUpstreamError(w, err)
 		return
 	}
 	converted, err := translator.OpenAIToResponsesResponse(payload, model)
 	if err != nil {
+		if stopAndReportError(w, ka, "openai", errors.New("转换 Responses 响应失败: "+err.Error())) {
+			return
+		}
 		writeOpenAIError(w, http.StatusBadGateway, "server_error", "转换 Responses 响应失败: "+err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(converted)
+	finishNonStreamKeepalive(w, ka, http.StatusOK, converted)
 }
 
 func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, body io.Reader, _ *accounts.Account) {

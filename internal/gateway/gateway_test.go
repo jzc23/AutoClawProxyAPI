@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"autoclaw2api/internal/accounts"
 	"autoclaw2api/internal/config"
@@ -220,5 +221,77 @@ func TestGatewayAuthFailoverAndPerAccountProxy(t *testing.T) {
 	handler.ServeHTTP(pxRec, pxReq)
 	if pxRec.Code != http.StatusOK || !strings.Contains(pxRec.Body.String(), "经由专属代理回复") || proxyHits.Load() < 1 {
 		t.Fatalf("账号绑定固定代理后未命中专属代理服务器: status=%d proxyHits=%d body=%s", pxRec.Code, proxyHits.Load(), pxRec.Body.String())
+	}
+}
+
+func TestNonStreamKeepaliveWhitespace(t *testing.T) {
+	// 缩短心跳参数便于测试（包级变量，defer 恢复）
+	oldGrace, oldInterval := keepaliveGrace, keepaliveInterval
+	keepaliveGrace = 150 * time.Millisecond
+	keepaliveInterval = 150 * time.Millisecond
+	defer func() {
+		keepaliveGrace, keepaliveInterval = oldGrace, oldInterval
+	}()
+
+	// 1. 长生成（超过宽限期）：响应体应以空白心跳开头，且整体仍是可解析的合法 JSON
+	slowUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(700 * time.Millisecond) // 期间应触发多次心跳
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cmpl-1","object":"chat.completion","model":"glm-5.3-flash","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"慢速回复"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer slowUpstream.Close()
+
+	srvSlow, handlerSlow, _, cfgSlow := setupTestServer(t, slowUpstream.URL)
+	_ = srvSlow
+	vkey := config.GenerateVKey()
+	if _, err := cfgSlow.Update(func(c *config.Config) error {
+		c.APIKeys = []config.APIKeyItem{{ID: "k1", Name: "主密钥", Key: vkey, Enabled: true}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"glm-5.3-flash","stream":false,"messages":[{"role":"user","content":"慢请求"}]}`))
+	req.Header.Set("Authorization", "Bearer "+vkey)
+	rec := httptest.NewRecorder()
+	handlerSlow.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.HasPrefix(body, "  ") {
+		t.Fatalf("超过宽限期的长生成应包含空白心跳前缀，实际: %q", body)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("心跳空白 + JSON 应可整体解析: %v", err)
+	}
+	if !strings.Contains(body, "慢速回复") {
+		t.Fatalf("心跳不应破坏最终 JSON 内容: %s", body)
+	}
+
+	// 2. 快速路径（宽限期内完成）：不应有任何心跳前缀，响应为纯 JSON
+	fastUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cmpl-2","object":"chat.completion","model":"glm-5.3-flash","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"快速回复"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer fastUpstream.Close()
+
+	srvFast, handlerFast, _, cfgFast := setupTestServer(t, fastUpstream.URL)
+	_ = srvFast
+	if _, err := cfgFast.Update(func(c *config.Config) error {
+		c.APIKeys = []config.APIKeyItem{{ID: "k1", Name: "主密钥", Key: vkey, Enabled: true}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fastReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"glm-5.3-flash","stream":false,"messages":[{"role":"user","content":"快请求"}]}`))
+	fastReq.Header.Set("Authorization", "Bearer "+vkey)
+	fastRec := httptest.NewRecorder()
+	handlerFast.ServeHTTP(fastRec, fastReq)
+	fastBody := fastRec.Body.String()
+	if strings.HasPrefix(fastBody, " ") {
+		t.Fatalf("宽限期内完成的请求不应有心跳前缀: %q", fastBody)
+	}
+	if !strings.HasPrefix(fastBody, "{") || !strings.Contains(fastBody, "快速回复") {
+		t.Fatalf("快速路径应返回纯 JSON: %s", fastBody)
 	}
 }

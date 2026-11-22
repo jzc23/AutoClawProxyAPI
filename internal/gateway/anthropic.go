@@ -63,19 +63,25 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// 非流式：启用空白心跳保活，长生成期间持续重置反向代理/Cloudflare 的读超时，避免连接被切断返回 504
+	ka := startNonStreamKeepalive(w)
 	payload, _, err := s.executeChatWithFailover(r.Context(), model, chatBody)
 	if err != nil {
+		if stopAndReportError(w, ka, "anthropic", err) {
+			return
+		}
 		writeAnthropicUpstreamError(w, err)
 		return
 	}
 	converted, err := translator.OpenAIToAnthropicResponse(payload, model)
 	if err != nil {
+		if stopAndReportError(w, ka, "anthropic", errors.New("转换 Anthropic 响应失败: "+err.Error())) {
+			return
+		}
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "转换 Anthropic 响应失败: "+err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(converted)
+	finishNonStreamKeepalive(w, ka, http.StatusOK, converted)
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
