@@ -24,6 +24,11 @@ import (
 	"autoclaw2api/internal/netx"
 )
 
+// MihomoResolver 由 mihomo 订阅代理桥实现，负责将订阅节点名称解析为本机回环 mixed 代理地址。
+type MihomoResolver interface {
+	ResolveNodeProxyURL(nodeName string) (proxyURL string, resolvedName string, err error)
+}
+
 type nodeHealth struct {
 	Status    string
 	Checking  bool
@@ -34,16 +39,18 @@ type nodeHealth struct {
 
 // Manager 负责管理全局代理池、三级出口绑定（账号 → 区域 → 默认直连）、测活调度与节点专属连接池。
 type Manager struct {
-	mu           sync.RWMutex
-	filePath     string
-	logger       *logging.Logger
-	state        diskState
-	health       map[string]*nodeHealth
-	transports   map[string]*http.Transport
-	directTr     *http.Transport
-	poolRR       uint64
-	healthWakeCh chan struct{}
-	probeSlots   chan struct{}
+	mu             sync.RWMutex
+	filePath       string
+	logger         *logging.Logger
+	state          diskState
+	health         map[string]*nodeHealth
+	transports     map[string]*http.Transport
+	mihomoTr       map[string]*http.Transport
+	mihomoResolver MihomoResolver
+	directTr       *http.Transport
+	poolRR         uint64
+	healthWakeCh   chan struct{}
+	probeSlots     chan struct{}
 }
 
 // NewManager 初始化代理池管理器，加载持久化数据并在首次升级时兼容迁移旧版静态代理配置。
@@ -60,6 +67,7 @@ func NewManager(dataDir string, legacyProxy config.ProxyConfig, logger *logging.
 		logger:       logger,
 		health:       make(map[string]*nodeHealth),
 		transports:   make(map[string]*http.Transport),
+		mihomoTr:     make(map[string]*http.Transport),
 		directTr:     buildDirectTransport(),
 		healthWakeCh: make(chan struct{}, 1),
 		probeSlots:   make(chan struct{}, 8),
@@ -78,6 +86,13 @@ func NewManager(dataDir string, legacyProxy config.ProxyConfig, logger *logging.
 		return nil, err
 	}
 	return m, nil
+}
+
+// SetMihomoResolver 注册 mihomo 订阅节点解析器，使账号与登录流程可直接选择任意机场订阅节点。
+func (m *Manager) SetMihomoResolver(r MihomoResolver) {
+	m.mu.Lock()
+	m.mihomoResolver = r
+	m.mu.Unlock()
 }
 
 func (m *Manager) loadOrMigrate(legacy config.ProxyConfig) error {
@@ -494,6 +509,9 @@ func (m *Manager) SetRegionBinding(region string, b Binding) error {
 	if reg != "cn" && reg != "global" {
 		return fmt.Errorf("无效区域标识: %s（仅支持 cn / global）", region)
 	}
+	if strings.EqualFold(strings.TrimSpace(b.Mode), ModeMihomo) {
+		return errors.New("mihomo 节点专用于登录换票，不用于区域日常出站")
+	}
 	norm := b.Normalize(false)
 
 	m.mu.Lock()
@@ -507,11 +525,14 @@ func (m *Manager) SetRegionBinding(region string, b Binding) error {
 	return m.saveLocked()
 }
 
-// SetAccountBinding 设置单个账号的出口绑定策略（inherit / direct / pool / fixed）。
+// SetAccountBinding 设置单个账号的日常出口绑定策略（inherit / direct / pool / fixed）。
 func (m *Manager) SetAccountBinding(accountID string, b Binding) error {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return errors.New("账号 ID 不能为空")
+	}
+	if strings.EqualFold(strings.TrimSpace(b.Mode), ModeMihomo) {
+		return errors.New("mihomo 节点专用于登录换票，不绑定到账号日常出站")
 	}
 	norm := b.Normalize(true)
 
@@ -583,9 +604,10 @@ func (m *Manager) DescribeAccountRoute(accountID, region string) RouteInfo {
 	}
 
 	info := RouteInfo{
-		AccountMode:   accBind.Mode,
-		AccountNodeID: accBind.ProxyID,
-		EffectiveMode: eff.Mode,
+		AccountMode:       accBind.Mode,
+		AccountNodeID:     accBind.ProxyID,
+		AccountMihomoNode: accBind.MihomoNode,
+		EffectiveMode:     eff.Mode,
 	}
 
 	prefix := ""
@@ -598,6 +620,20 @@ func (m *Manager) DescribeAccountRoute(accountID, region string) RouteInfo {
 		info.Summary = prefix + "直连"
 	case ModePool:
 		info.Summary = prefix + "代理池自动分配"
+	case ModeMihomo:
+		info.MihomoNode = eff.MihomoNode
+		info.NodeName = eff.MihomoNode
+		if m.mihomoResolver != nil {
+			if _, resolved, err := m.mihomoResolver.ResolveNodeProxyURL(eff.MihomoNode); err == nil {
+				info.MihomoNode = resolved
+				info.NodeName = resolved
+				info.Summary = fmt.Sprintf("%s机场节点：%s", prefix, resolved)
+			} else {
+				info.Summary = fmt.Sprintf("%s机场节点：%s（未就绪）", prefix, eff.MihomoNode)
+			}
+		} else {
+			info.Summary = fmt.Sprintf("%s机场节点：%s", prefix, eff.MihomoNode)
+		}
 	case ModeFixed:
 		if node, found := m.findNodeLocked(eff.ProxyID); found {
 			info.NodeID = node.ID
@@ -633,6 +669,54 @@ func (m *Manager) ClientForRegion(region string, timeout time.Duration) (*http.C
 	return m.ClientForAccount("", region, timeout)
 }
 
+// ClientForExit 根据本次登录/操作临时指定的出口模式（direct / region / fixed / mihomo）返回标准 Go HTTP 客户端及人类可读出口标签。
+func (m *Manager) ClientForExit(exitMode, proxyID, mihomoNode, fallbackRegion string, timeout time.Duration) (*http.Client, string, error) {
+	mode := strings.ToLower(strings.TrimSpace(exitMode))
+	switch mode {
+	case "", ModeDirect:
+		return &http.Client{Timeout: timeout, Transport: m.directTr}, "直连", nil
+	case "region":
+		c, err := m.ClientForRegion(fallbackRegion, timeout)
+		if err != nil {
+			return nil, "", err
+		}
+		route := m.DescribeAccountRoute("", fallbackRegion)
+		return c, route.Summary, nil
+	case ModeFixed:
+		id := strings.TrimSpace(proxyID)
+		m.mu.Lock()
+		node, ok := m.findNodeLocked(id)
+		if !ok {
+			m.mu.Unlock()
+			return nil, "", fmt.Errorf("所选代理节点 (%s) 不存在", id)
+		}
+		if !node.Enabled {
+			m.mu.Unlock()
+			return nil, "", fmt.Errorf("所选代理节点「%s」已停用", node.Name)
+		}
+		tr, err := m.getOrCreateTransportLocked(node)
+		m.mu.Unlock()
+		if err != nil {
+			return nil, "", err
+		}
+		return &http.Client{Timeout: timeout, Transport: tr}, "自备代理：" + node.Name, nil
+	case ModeMihomo:
+		name := strings.TrimSpace(mihomoNode)
+		if name == "" {
+			name = strings.TrimSpace(proxyID)
+		}
+		m.mu.Lock()
+		tr, resolved, err := m.getOrCreateMihomoTransportLocked(name)
+		m.mu.Unlock()
+		if err != nil {
+			return nil, "", err
+		}
+		return &http.Client{Timeout: timeout, Transport: tr}, "机场节点：" + resolved, nil
+	default:
+		return &http.Client{Timeout: timeout, Transport: m.directTr}, "直连", nil
+	}
+}
+
 func (m *Manager) resolveTransport(accountID, region string) (*http.Transport, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -655,6 +739,9 @@ func (m *Manager) resolveTransport(accountID, region string) (*http.Transport, e
 	switch eff.Mode {
 	case ModeDirect:
 		return m.directTr, nil
+	case ModeMihomo:
+		tr, _, err := m.getOrCreateMihomoTransportLocked(eff.MihomoNode)
+		return tr, err
 	case ModeFixed:
 		node, ok := m.findNodeLocked(eff.ProxyID)
 		if !ok {
@@ -673,6 +760,28 @@ func (m *Manager) resolveTransport(accountID, region string) (*http.Transport, e
 	default:
 		return m.directTr, nil
 	}
+}
+
+func (m *Manager) getOrCreateMihomoTransportLocked(nodeName string) (*http.Transport, string, error) {
+	if m.mihomoResolver == nil {
+		return nil, "", errors.New("mihomo 订阅代理桥未初始化")
+	}
+	proxyURL, resolved, err := m.mihomoResolver.ResolveNodeProxyURL(nodeName)
+	if err != nil {
+		return nil, "", err
+	}
+	if m.mihomoTr == nil {
+		m.mihomoTr = make(map[string]*http.Transport)
+	}
+	if tr, ok := m.mihomoTr[proxyURL]; ok {
+		return tr, resolved, nil
+	}
+	tr, err := buildProxyTransport(proxyURL)
+	if err != nil {
+		return nil, "", err
+	}
+	m.mihomoTr[proxyURL] = tr
+	return tr, resolved, nil
 }
 
 func (m *Manager) pickPoolNodeLocked(accountID string) (Node, bool) {

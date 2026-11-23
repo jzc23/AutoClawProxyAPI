@@ -175,3 +175,58 @@ func TestManagerBindingsPriorityGuardAndTransportEviction(t *testing.T) {
 		t.Fatalf("解绑后删除节点应成功: %v", err)
 	}
 }
+
+type stubMihomoResolver struct {
+	nodes map[string]string
+}
+
+func (s stubMihomoResolver) ResolveNodeProxyURL(name string) (string, string, error) {
+	if u, ok := s.nodes[name]; ok {
+		return u, name, nil
+	}
+	return "", "", ErrNodeNotFound
+}
+
+func TestMihomoBindingAndLoginClientForExit(t *testing.T) {
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("via-mihomo-local-mixed"))
+	}))
+	defer proxySrv.Close()
+
+	mgr, err := NewManager(t.TempDir(), config.ProxyConfig{}, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	mgr.SetMihomoResolver(stubMihomoResolver{
+		nodes: map[string]string{
+			"🇯🇵 日本 | 01": proxySrv.URL,
+		},
+	})
+
+	// 1. mihomo 登录节点专用于登录换票，禁止绑定到账号或区域日常出站
+	if err := mgr.SetAccountBinding("acc-jp-1", Binding{Mode: ModeMihomo, MihomoNode: "🇯🇵 日本 | 01"}); err == nil {
+		t.Fatalf("账号日常出口不应允许绑定 mihomo 登录节点")
+	}
+	if err := mgr.SetRegionBinding("global", Binding{Mode: ModeMihomo, MihomoNode: "🇯🇵 日本 | 01"}); err == nil {
+		t.Fatalf("区域日常出口不应允许绑定 mihomo 登录节点")
+	}
+	route := mgr.DescribeAccountRoute("acc-jp-1", "global")
+	if route.EffectiveMode != ModeDirect {
+		t.Fatalf("默认日常出口应保持直连，实际: %+v", route)
+	}
+
+	// 2. 登录换票专用 ClientForExit(mihomo) 正常经由本地 mixed 端口转发
+	cLogin, usedLabel, err := mgr.ClientForExit(ModeMihomo, "", "🇯🇵 日本 | 01", "global", 5*time.Second)
+	if err != nil || !strings.Contains(usedLabel, "🇯🇵 日本 | 01") {
+		t.Fatalf("ClientForExit(mihomo) 失败: label=%q err=%v", usedLabel, err)
+	}
+	resp2, err := cLogin.Get("http://example.invalid/login")
+	if err != nil {
+		t.Fatalf("经由登录指定 mihomo 节点请求失败: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("期望 HTTP 200，实际 %d", resp2.StatusCode)
+	}
+}

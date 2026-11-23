@@ -27,8 +27,10 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	stickyKey := deriveStickySessionKey(model, rawBody, chatBody)
+
 	if stream {
-		resp, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody)
+		resp, _, err := s.executeChatStreamWithFailover(r.Context(), model, chatBody, stickyKey)
 		if err != nil {
 			writeAnthropicUpstreamError(w, err)
 			return
@@ -65,7 +67,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	// 非流式：启用空白心跳保活，长生成期间持续重置反向代理/Cloudflare 的读超时，避免连接被切断返回 504
 	ka := startNonStreamKeepalive(w)
-	payload, _, err := s.executeChatWithFailover(r.Context(), model, chatBody)
+	payload, _, err := s.executeChatWithFailover(r.Context(), model, chatBody, stickyKey)
 	if err != nil {
 		if stopAndReportError(w, ka, "anthropic", err) {
 			return

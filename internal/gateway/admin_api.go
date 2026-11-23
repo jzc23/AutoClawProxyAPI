@@ -12,6 +12,7 @@ import (
 	"autoclaw2api/internal/accounts"
 	"autoclaw2api/internal/config"
 	"autoclaw2api/internal/protocol"
+	"autoclaw2api/internal/proxypool"
 )
 
 func (s *Server) handleAdminOverview(w http.ResponseWriter, _ *http.Request) {
@@ -26,6 +27,21 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, _ *http.Request) {
 			healthyNodes++
 		}
 	}
+
+	var mihomoStats map[string]any
+	if s.mihomoMgr != nil {
+		ms := s.mihomoMgr.Snapshot()
+		mihomoStats = map[string]any{
+			"binary_found":    ms.BinaryFound,
+			"running":         ms.Running,
+			"enabled":         ms.Enabled,
+			"total_nodes":     ms.TotalCount,
+			"healthy_nodes":   ms.HealthyCount,
+			"next_login_node": ms.NextLoginNode,
+		}
+	}
+	recentBal := s.pool.BalanceHistory("", 12)
+	recentSplit := s.pool.BalanceHistorySplit("", 50)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":     config.Version,
@@ -43,6 +59,9 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, _ *http.Request) {
 			"healthy": healthyNodes,
 			"regions": proxySnap.Regions,
 		},
+		"mihomo_stats":           mihomoStats,
+		"recent_balance_changes": recentBal,
+		"balance_abnormal_count": recentSplit.AbnormalCount,
 		"upstream": map[string]string{
 			"cn_base_url":     protocol.ResolveBaseURL(protocol.RegionCN, cfg.Upstream.CNBaseURL),
 			"global_base_url": protocol.ResolveBaseURL(protocol.RegionGlobal, cfg.Upstream.GlobalBaseURL),
@@ -127,7 +146,7 @@ func (s *Server) handleAdminImportAccount(w http.ResponseWriter, r *http.Request
 	go func(id string, region protocol.Region) {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
-		_, _ = s.scheduler.RefreshAccountBalance(ctx, id)
+		_, _ = s.scheduler.RefreshAccountBalanceWithTrigger(ctx, id, "login")
 		_, _ = s.router.SyncRegionModels(ctx, region)
 	}(view.ID, view.Region)
 
@@ -137,55 +156,184 @@ func (s *Server) handleAdminImportAccount(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func (s *Server) nextLoginNodePreview() string {
+	if s.mihomoMgr == nil {
+		return ""
+	}
+	if n, ok := s.mihomoMgr.PeekNextLoginNode(); ok {
+		return n.Name
+	}
+	return ""
+}
+
+// resolveLoginExit 解析本次登录/换票所使用的出口客户端：
+// - exitMode == "auto" 时，从 mihomo 登录节点桥自动轮换挑选下一个健康节点（advanceAuto=true 推进游标，false 仅预览复用）；
+// - 若 mihomo 未启动或无可用节点，自动平滑回退直连；
+// - exitMode == "mihomo" / "fixed" / "direct" / "region" 时按用户显式选择执行。
+func (s *Server) resolveLoginExit(exitMode, proxyID, mihomoNode, fallbackRegion string, advanceAuto bool, timeout time.Duration) (
+	client *http.Client,
+	resolvedMode string,
+	resolvedProxyID string,
+	resolvedMihomo string,
+	usedExit string,
+	err error,
+) {
+	mode := strings.ToLower(strings.TrimSpace(exitMode))
+	pid := strings.TrimSpace(proxyID)
+	mh := strings.TrimSpace(mihomoNode)
+
+	if mode == "auto" {
+		if s.mihomoMgr != nil {
+			var (
+				pickedName string
+				ok         bool
+			)
+			if advanceAuto {
+				if n, found := s.mihomoMgr.PickNextLoginNode(); found {
+					pickedName = n.Name
+					ok = true
+				}
+			} else {
+				if n, found := s.mihomoMgr.PeekNextLoginNode(); found {
+					pickedName = n.Name
+					ok = true
+				}
+			}
+			if ok && pickedName != "" {
+				c, label, e := s.proxyMgr.ClientForExit(proxypool.ModeMihomo, "", pickedName, fallbackRegion, timeout)
+				if e == nil {
+					return c, proxypool.ModeMihomo, "", pickedName, label, nil
+				}
+			}
+		}
+		// mihomo 不可用时平滑回落直连
+		mode = proxypool.ModeDirect
+		pid = ""
+		mh = ""
+	}
+
+	c, label, e := s.proxyMgr.ClientForExit(mode, pid, mh, fallbackRegion, timeout)
+	if e != nil {
+		return nil, "", "", "", "", e
+	}
+	if mode == "" {
+		mode = proxypool.ModeDirect
+	}
+	return c, mode, pid, mh, label, nil
+}
+
 func (s *Server) handleAdminSMSSend(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Phone string `json:"phone"`
+		Phone      string `json:"phone"`
+		ExitMode   string `json:"exit_mode"`
+		ProxyID    string `json:"proxy_id"`
+		MihomoNode string `json:"mihomo_node"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "参数解析失败"})
 		return
 	}
 	baseURL := s.baseURLFor(protocol.RegionCN)
-	client, errClient := s.proxyMgr.ClientForRegion(string(protocol.RegionCN), 20*time.Second)
+	client, resMode, resProxyID, resMihomo, usedExit, errClient := s.resolveLoginExit(
+		body.ExitMode, body.ProxyID, body.MihomoNode, string(protocol.RegionCN), true, 20*time.Second,
+	)
 	if errClient != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "国内区代理出口不可用: " + errClient.Error()})
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "国内区登录出口不可用: " + errClient.Error()})
 		return
 	}
 
 	deviceID, err := protocol.SendSMSCode(r.Context(), client, baseURL, body.Phone)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":           err.Error(),
+			"used_exit":       usedExit,
+			"used_node":       resMihomo,
+			"next_login_node": s.nextLoginNodePreview(),
+		})
 		return
 	}
+
+	// 将本次选中的登录出口绑定到 deviceID 会话，确保后续 verify-code 严格复用同一个节点
+	s.oauthMu.Lock()
+	now := time.Now()
+	for k, v := range s.smsSessions {
+		if now.After(v.ExpiresAt) {
+			delete(s.smsSessions, k)
+		}
+	}
+	s.smsSessions[deviceID] = smsLoginSession{
+		Phone:      strings.TrimSpace(body.Phone),
+		ExitMode:   resMode,
+		ProxyID:    resProxyID,
+		MihomoNode: resMihomo,
+		UsedExit:   usedExit,
+		ExpiresAt:  now.Add(10 * time.Minute),
+	}
+	s.oauthMu.Unlock()
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"message":   "短信验证码已发送，请查收并输入 6 位数字验证码",
-		"device_id": deviceID,
+		"message":         fmt.Sprintf("短信验证码已发送（本次登录节点：%s），请查收并输入 6 位数字验证码", usedExit),
+		"device_id":       deviceID,
+		"used_exit":       usedExit,
+		"used_node":       resMihomo,
+		"next_login_node": s.nextLoginNodePreview(),
 	})
 }
 
 func (s *Server) handleAdminSMSVerify(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Phone    string `json:"phone"`
-		Code     string `json:"code"`
-		DeviceID string `json:"device_id"`
-		Alias    string `json:"alias"`
+		Phone      string `json:"phone"`
+		Code       string `json:"code"`
+		DeviceID   string `json:"device_id"`
+		Alias      string `json:"alias"`
+		ExitMode   string `json:"exit_mode"`
+		ProxyID    string `json:"proxy_id"`
+		MihomoNode string `json:"mihomo_node"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "参数解析失败"})
 		return
 	}
+
+	// 优先沿用 send-code 阶段锁定的登录节点，保证同一次短信登录全流程走同一出口 IP
+	devKey := strings.TrimSpace(body.DeviceID)
+	s.oauthMu.Lock()
+	smsSess, hasSess := s.smsSessions[devKey]
+	s.oauthMu.Unlock()
+
+	exitMode := strings.TrimSpace(body.ExitMode)
+	proxyID := strings.TrimSpace(body.ProxyID)
+	mihomoNode := strings.TrimSpace(body.MihomoNode)
+	if hasSess && !time.Now().After(smsSess.ExpiresAt) && (exitMode == "" || strings.EqualFold(exitMode, "auto")) {
+		exitMode = smsSess.ExitMode
+		proxyID = smsSess.ProxyID
+		mihomoNode = smsSess.MihomoNode
+	}
+
 	baseURL := s.baseURLFor(protocol.RegionCN)
-	client, errClient := s.proxyMgr.ClientForRegion(string(protocol.RegionCN), 20*time.Second)
+	client, _, _, resMihomo, usedExit, errClient := s.resolveLoginExit(
+		exitMode, proxyID, mihomoNode, string(protocol.RegionCN), false, 20*time.Second,
+	)
 	if errClient != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "国内区代理出口不可用: " + errClient.Error()})
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "国内区登录出口不可用: " + errClient.Error()})
 		return
 	}
 
 	data, err := protocol.VerifySMSLogin(r.Context(), client, baseURL, body.Phone, body.Code, body.DeviceID)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":           err.Error(),
+			"used_exit":       usedExit,
+			"used_node":       resMihomo,
+			"next_login_node": s.nextLoginNodePreview(),
+		})
 		return
 	}
+
+	s.oauthMu.Lock()
+	delete(s.smsSessions, devKey)
+	s.oauthMu.Unlock()
+
 	cred := &accounts.Credential{
 		Region:       protocol.RegionCN,
 		AccessToken:  data.AccessToken,
@@ -202,35 +350,49 @@ func (s *Server) handleAdminSMSVerify(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "保存凭证失败: " + err.Error()})
 		return
 	}
+	// 职责明确：mihomo 登录节点仅用于登录换票，绝不强绑到新账号日常出站（保持原有默认直连或区域代理池策略）
+	route := s.proxyMgr.DescribeAccountRoute(view.ID, string(view.Region))
+	view.ProxyRoute = &route
 	if s.logger != nil {
-		s.logger.Info("Admin", "国内版短信登录成功，已入池账号 [%s]", view.Label)
+		s.logger.Info("Admin", "国内版短信登录成功，已入池账号 [%s]（登录出口：%s，日常出口：%s）", view.Label, usedExit, route.Summary)
 	}
-	go func() {
+	go func(accID string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		_, _ = s.scheduler.RefreshAccountBalanceWithTrigger(ctx, accID, "login")
 		_, _ = s.router.SyncRegionModels(ctx, protocol.RegionCN)
-	}()
+	}(view.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"message": "国内版账号登录成功",
-		"account": view,
+		"message":         fmt.Sprintf("国内版账号登录成功（本次登录节点：%s）", usedExit),
+		"used_exit":       usedExit,
+		"used_node":       resMihomo,
+		"next_login_node": s.nextLoginNodePreview(),
+		"account":         view,
 	})
 }
 
 func (s *Server) handleAdminOAuthCaptcha(w http.ResponseWriter, r *http.Request) {
 	baseURL := s.baseURLFor(protocol.RegionGlobal)
-	client, errClient := s.proxyMgr.ClientForRegion(string(protocol.RegionGlobal), 15*time.Second)
+	q := r.URL.Query()
+	// captcha 阶段仅预览而不推进轮询游标，确保随后 oauth/start 与 oauth/callback 命中同一节点
+	client, _, _, resMihomo, usedExit, errClient := s.resolveLoginExit(
+		q.Get("exit_mode"), q.Get("proxy_id"), q.Get("mihomo_node"), string(protocol.RegionGlobal), false, 15*time.Second,
+	)
 	if errClient != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "国际区代理出口不可用: " + errClient.Error()})
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "国际区登录出口不可用: " + errClient.Error()})
 		return
 	}
 
 	conf, err := protocol.FetchOAuthCaptchaConfig(r.Context(), client, baseURL)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error(), "used_exit": usedExit, "used_node": resMihomo})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"captcha": conf,
+		"captcha":         conf,
+		"used_exit":       usedExit,
+		"used_node":       resMihomo,
+		"next_login_node": s.nextLoginNodePreview(),
 		"variants": []map[string]string{
 			{"id": "zai", "label": "Zai 登录", "callback_hint": protocol.DefaultNavigateURI(protocol.OAuthProviderZai)},
 			{"id": "google", "label": "Google 登录", "callback_hint": protocol.DefaultNavigateURI(protocol.OAuthProviderGoogle)},
@@ -242,6 +404,9 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Provider    string `json:"provider"`
 		CaptchaText string `json:"ali_captcha_verify_param"`
+		ExitMode    string `json:"exit_mode"`
+		ProxyID     string `json:"proxy_id"`
+		MihomoNode  string `json:"mihomo_node"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "参数解析失败"})
@@ -255,18 +420,27 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	deviceID := protocol.RandomHex(32)
 	navigateURI := protocol.DefaultNavigateURI(provider)
 	baseURL := s.baseURLFor(protocol.RegionGlobal)
-	client, errClient := s.proxyMgr.ClientForRegion(string(protocol.RegionGlobal), 15*time.Second)
+
+	// 发起本次 OAuth 授权会话时正式分配并锁定节点（auto 模式下推进游标，下一次新登录自动切换下一个健康节点）
+	client, resMode, resProxyID, resMihomo, usedExit, errClient := s.resolveLoginExit(
+		body.ExitMode, body.ProxyID, body.MihomoNode, string(protocol.RegionGlobal), true, 15*time.Second,
+	)
 	if errClient != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "国际区代理出口不可用: " + errClient.Error()})
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "国际区登录出口不可用: " + errClient.Error()})
 		return
 	}
 
 	authURL, err := protocol.RequestOAuthURL(r.Context(), client, baseURL, provider, navigateURI, body.CaptchaText, deviceID)
 	if err != nil {
 		if s.logger != nil {
-			s.logger.Warn("Admin", "国际版 %s OAuth 第一步获取授权链接失败: %s", provider, err.Error())
+			s.logger.Warn("OAuth", "获取国际版 %s 授权链接失败（出口：%s）: %v", strings.ToUpper(string(provider)), usedExit, err)
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":           err.Error(),
+			"used_exit":       usedExit,
+			"used_node":       resMihomo,
+			"next_login_node": s.nextLoginNodePreview(),
+		})
 		return
 	}
 
@@ -282,16 +456,23 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		Provider:    provider,
 		DeviceID:    deviceID,
 		NavigateURI: navigateURI,
+		ExitMode:    resMode,
+		ProxyID:     resProxyID,
+		MihomoNode:  resMihomo,
+		UsedExit:    usedExit,
 		ExpiresAt:   now.Add(10 * time.Minute),
 	}
 	s.oauthMu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"session_id":    sessionID,
-		"provider":      provider,
-		"auth_url":      authURL,
-		"callback_hint": navigateURI,
-		"message":       fmt.Sprintf("请在新标签页完成 %s 授权，然后将浏览器最终跳转的 %s?code=... 整条链接粘贴回来", strings.ToUpper(string(provider)), navigateURI),
+		"session_id":      sessionID,
+		"provider":        provider,
+		"auth_url":        authURL,
+		"callback_hint":   navigateURI,
+		"used_exit":       usedExit,
+		"used_node":       resMihomo,
+		"next_login_node": s.nextLoginNodePreview(),
+		"message":         fmt.Sprintf("请在新标签页完成 %s 授权（本次登录节点：%s），然后将浏览器最终跳转的 %s?code=... 整条链接粘贴回来", strings.ToUpper(string(provider)), usedExit, navigateURI),
 	})
 }
 
@@ -300,6 +481,9 @@ func (s *Server) handleAdminOAuthCallback(w http.ResponseWriter, r *http.Request
 		SessionID   string `json:"session_id"`
 		CallbackURL string `json:"callback_url"`
 		Alias       string `json:"alias"`
+		ExitMode    string `json:"exit_mode"`
+		ProxyID     string `json:"proxy_id"`
+		MihomoNode  string `json:"mihomo_node"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "参数解析失败"})
@@ -324,19 +508,36 @@ func (s *Server) handleAdminOAuthCallback(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// 同一次 OAuth 会话严格复用 oauth-url 阶段锁定的节点；仅当用户显式手动切到非 auto 特定节点时才覆盖
+	exitMode := strings.TrimSpace(body.ExitMode)
+	proxyID := strings.TrimSpace(body.ProxyID)
+	mihomoNode := strings.TrimSpace(body.MihomoNode)
+	if exitMode == "" || strings.EqualFold(exitMode, "auto") {
+		exitMode = sess.ExitMode
+		proxyID = sess.ProxyID
+		mihomoNode = sess.MihomoNode
+	}
+
 	baseURL := s.baseURLFor(protocol.RegionGlobal)
-	client, errClient := s.proxyMgr.ClientForRegion(string(protocol.RegionGlobal), 15*time.Second)
+	client, _, _, resMihomo, usedExit, errClient := s.resolveLoginExit(
+		exitMode, proxyID, mihomoNode, string(protocol.RegionGlobal), false, 20*time.Second,
+	)
 	if errClient != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "国际区代理出口不可用: " + errClient.Error()})
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "国际区登录出口不可用: " + errClient.Error()})
 		return
 	}
 
 	data, err := protocol.ExchangeOAuthCode(r.Context(), client, baseURL, provider, code, upstreamState, sess.NavigateURI, sess.DeviceID)
 	if err != nil {
 		if s.logger != nil {
-			s.logger.Warn("Admin", "国际版 %s OAuth 第二步换票失败（code/state=%s）: %s", provider, code, err.Error())
+			s.logger.Warn("OAuth", "国际版 %s 回调换票失败（出口：%s）: %v", strings.ToUpper(string(provider)), usedExit, err)
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":           err.Error(),
+			"used_exit":       usedExit,
+			"used_node":       resMihomo,
+			"next_login_node": s.nextLoginNodePreview(),
+		})
 		return
 	}
 
@@ -359,18 +560,25 @@ func (s *Server) handleAdminOAuthCallback(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "保存凭证失败: " + err.Error()})
 		return
 	}
+	// 职责明确：mihomo 登录节点仅用于换票拿凭证，绝不自动绑定到新账号日常出站（保持原有默认直连或区域代理池策略）
+	route := s.proxyMgr.DescribeAccountRoute(view.ID, string(view.Region))
+	view.ProxyRoute = &route
 	if s.logger != nil {
-		s.logger.Info("Admin", "国际版 %s OAuth 登录成功，已入池账号 [%s]", provider, view.Label)
+		s.logger.Info("Admin", "国际版 %s OAuth 登录成功，已入池账号 [%s]（本次登录节点：%s，日常出口：%s）", provider, view.Label, usedExit, route.Summary)
 	}
-	go func() {
+	go func(accID string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		_, _ = s.scheduler.RefreshAccountBalanceWithTrigger(ctx, accID, "login")
 		_, _ = s.router.SyncRegionModels(ctx, protocol.RegionGlobal)
-	}()
+	}(view.ID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"message": "国际版账号登录成功",
-		"account": view,
+		"message":         fmt.Sprintf("国际版账号登录成功（本次登录节点：%s）", usedExit),
+		"used_exit":       usedExit,
+		"used_node":       resMihomo,
+		"next_login_node": s.nextLoginNodePreview(),
+		"account":         view,
 	})
 }
 
@@ -482,11 +690,71 @@ func (s *Server) handleAdminRefreshBalance(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleAdminRefreshAllBalances(w http.ResponseWriter, r *http.Request) {
-	okCount := s.scheduler.RefreshAllBalances(r.Context())
+	okCount := s.scheduler.RefreshAllBalancesWithTrigger(r.Context(), "manual")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"message": fmt.Sprintf("已刷新 %d 个账号的积分余额", okCount),
 		"updated": okCount,
 		"stats":   s.pool.Stats(),
+	})
+}
+
+func (s *Server) handleAdminAccountBalanceHistory(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	limit := 300
+	if q := strings.TrimSpace(r.URL.Query().Get("limit")); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 300 {
+			limit = n
+		}
+	}
+	acc, ok := s.pool.GetByID(id)
+	label := id
+	bal := 0.0
+	balKnown := false
+	if ok {
+		label = acc.Cred.DisplayLabel()
+		bal = acc.Balance
+		balKnown = acc.BalanceKnown
+	}
+	split := s.pool.BalanceHistorySplit(id, limit)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"account_id":     id,
+		"account_label":  label,
+		"balance":        bal,
+		"balance_known":  balKnown,
+		"usage_history":  split.Usage,
+		"event_history":  split.Events,
+		"usage_count":    split.UsageCount,
+		"event_count":    split.EventCount,
+		"abnormal_count": split.AbnormalCount,
+		"history":        s.pool.BalanceHistory(id, limit),
+	})
+}
+
+func (s *Server) handleAdminClearAccountBalanceHistory(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	cleared := s.pool.ClearBalanceHistory(id)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message": fmt.Sprintf("已清空该账号积分变动流水（共清除 %d 条）", cleared),
+		"cleared": cleared,
+	})
+}
+
+func (s *Server) handleAdminBalanceHistory(w http.ResponseWriter, r *http.Request) {
+	accountID := strings.TrimSpace(r.URL.Query().Get("account_id"))
+	limit := 300
+	if q := strings.TrimSpace(r.URL.Query().Get("limit")); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 300 {
+			limit = n
+		}
+	}
+	split := s.pool.BalanceHistorySplit(accountID, limit)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"usage_history":  split.Usage,
+		"event_history":  split.Events,
+		"usage_count":    split.UsageCount,
+		"event_count":    split.EventCount,
+		"abnormal_count": split.AbnormalCount,
+		"history":        s.pool.BalanceHistory(accountID, limit),
 	})
 }
 

@@ -16,6 +16,7 @@ import (
 	"autoclaw2api/internal/config"
 	"autoclaw2api/internal/gateway"
 	"autoclaw2api/internal/logging"
+	"autoclaw2api/internal/mihomo"
 	"autoclaw2api/internal/protocol"
 	"autoclaw2api/internal/proxypool"
 	"autoclaw2api/internal/scheduler"
@@ -45,6 +46,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[Startup] 初始化代理池失败: %v\n", err)
 		os.Exit(1)
 	}
+	mihomoMgr, err := mihomo.NewManager(".", cfg.DataDir, logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Startup] 初始化 mihomo 订阅代理桥失败: %v\n", err)
+		os.Exit(1)
+	}
+	proxyMgr.SetMihomoResolver(mihomoMgr)
 
 	pool, err := accounts.NewPool(cfgMgr, logger)
 	if err != nil {
@@ -54,9 +61,11 @@ func main() {
 	router := accounts.NewRouter(cfgMgr, pool, proxyMgr, logger)
 	sched := scheduler.New(cfgMgr, pool, router, proxyMgr, logger)
 	srv := gateway.NewServer(cfgMgr, pool, router, proxyMgr, sched, logger)
+	srv.SetMihomoManager(mihomoMgr)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	mihomoMgr.Start(ctx)
 	proxyMgr.Start(ctx)
 	sched.Start(ctx)
 

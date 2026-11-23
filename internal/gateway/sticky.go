@@ -5,143 +5,141 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"strings"
-	"sync"
-	"time"
-
-	"autoclaw2api/internal/protocol"
 )
 
-// 会话粘性参数：同一会话在短时间内绑定到同一账号，提升上游 Prompt Cache 命中率，
-// 显著降低多轮长上下文对话在多账号间来回跳导致的积分翻倍消耗。
-const (
-	stickyTTL        = 15 * time.Minute
-	stickyMaxEntries = 1024
-)
-
-// stickyEntry 记录一条会话到账号的粘性绑定。
-type stickyEntry struct {
-	accID    string
-	region   protocol.Region
-	lastSeen time.Time
-}
-
-// stickyTable 维护会话键 → 账号的短时绑定表（惰性淘汰，容量上限防膨胀）。
-type stickyTable struct {
-	mu      sync.Mutex
-	entries map[string]stickyEntry
-}
-
-func newStickyTable() *stickyTable {
-	return &stickyTable{entries: make(map[string]stickyEntry)}
-}
-
-// lookup 查询会话当前绑定的账号；绑定已过期则顺带清除并返回空。
-func (t *stickyTable) lookup(key string) (string, protocol.Region, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	e, ok := t.entries[key]
-	if !ok {
-		return "", "", false
-	}
-	if time.Since(e.lastSeen) > stickyTTL {
-		delete(t.entries, key)
-		return "", "", false
-	}
-	return e.accID, e.region, true
-}
-
-// bind 写入或刷新会话绑定，容量超限时先淘汰过期项再按最久未使用淘汰。
-func (t *stickyTable) bind(key, accID string, region protocol.Region) {
-	if key == "" || accID == "" {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if _, exists := t.entries[key]; !exists && len(t.entries) >= stickyMaxEntries {
-		now := time.Now()
-		for k, e := range t.entries {
-			if now.Sub(e.lastSeen) > stickyTTL {
-				delete(t.entries, k)
-			}
-		}
-		for len(t.entries) >= stickyMaxEntries {
-			oldestKey := ""
-			var oldest time.Time
-			for k, e := range t.entries {
-				if oldestKey == "" || e.lastSeen.Before(oldest) {
-					oldestKey, oldest = k, e.lastSeen
-				}
-			}
-			if oldestKey == "" {
-				break
-			}
-			delete(t.entries, oldestKey)
-		}
-	}
-	t.entries[key] = stickyEntry{accID: accID, region: region, lastSeen: time.Now()}
-}
-
-// unbind 解除会话绑定（粘性账号调用失败切号时调用，后续请求改绑新账号）。
-func (t *stickyTable) unbind(key string) {
-	if key == "" {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	delete(t.entries, key)
-}
-
-// sessionKeyForChatBody 计算短时会话粘性键（对三种入站协议统一在转换后的
-// OpenAI chat 请求体上计算）。优先取客户端显式提供的会话标识；缺省时回退为
-// 模型 + 首条 system/developer/user 消息内容的哈希（多轮对话中该前缀稳定不变）。
-func sessionKeyForChatBody(requestedModel string, rawBody []byte) string {
-	if len(rawBody) == 0 {
-		return ""
-	}
-	var probe struct {
-		PromptCacheKey     string          `json:"prompt_cache_key"`
-		SafetyIdentifier   string          `json:"safety_identifier"`
-		User               string          `json:"user"`
-		Conversation       string          `json:"conversation"`
-		PreviousResponseID string          `json:"previous_response_id"`
-		SessionID          string          `json:"session_id"`
-		Metadata           json.RawMessage `json:"metadata"`
-		Messages           []struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
-	}
-	if err := json.Unmarshal(rawBody, &probe); err != nil {
+// deriveStickySessionKey 为多轮对话推导短时会话粘性键（同时覆盖 /v1/chat/completions、/v1/responses 与 /v1/messages）：
+//  1. 优先使用客户端显式会话/缓存标识（prompt_cache_key、conversation / conversation_id、previous_response_id、session_id、metadata.user_id）；
+//  2. 若未显式携带，则基于「模型 + 首条 system/developer 文本 + 首条 user 文本」计算稳定哈希，
+//     确保同一多轮长上下文对话稳定命中同一账号以提升上游 Prompt Cache 命中率。
+func deriveStickySessionKey(requestedModel string, rawReqBody, chatBody []byte) string {
+	model := strings.ToLower(strings.TrimSpace(requestedModel))
+	if model == "" {
 		return ""
 	}
 
-	// 1) 显式会话标识（请求级 ID）优先，天然跨轮稳定
-	for _, v := range []string{probe.PromptCacheKey, probe.SafetyIdentifier, probe.SessionID, probe.Conversation, probe.PreviousResponseID, probe.User} {
-		if s := strings.TrimSpace(v); s != "" {
-			return requestedModel + "|e:" + s
-		}
-	}
-	if len(probe.Metadata) > 0 {
-		var md map[string]any
-		if json.Unmarshal(probe.Metadata, &md) == nil {
-			for _, k := range []string{"session_id", "sessionId", "conversation_id"} {
-				if v, ok := md[k].(string); ok && strings.TrimSpace(v) != "" {
-					return requestedModel + "|e:" + strings.TrimSpace(v)
-				}
-			}
-		}
+	if explicit := extractExplicitSessionKey(rawReqBody); explicit != "" {
+		return hashStickyParts(model, "explicit", explicit)
 	}
 
-	// 2) 回退：模型 + 首条 system/developer/user 消息内容哈希
-	for _, msg := range probe.Messages {
-		switch strings.ToLower(strings.TrimSpace(msg.Role)) {
-		case "system", "developer", "user":
-			if len(msg.Content) == 0 {
-				continue
+	sysPrefix, userPrefix := extractConversationPrefix(chatBody)
+	if sysPrefix == "" && userPrefix == "" {
+		return ""
+	}
+	return hashStickyParts(model, "prefix", sysPrefix, userPrefix)
+}
+
+func hashStickyParts(parts ...string) string {
+	h := sha256.New()
+	for i, p := range parts {
+		if i > 0 {
+			_, _ = h.Write([]byte{0})
+		}
+		_, _ = h.Write([]byte(p))
+	}
+	return hex.EncodeToString(h.Sum(nil))[:32]
+}
+
+func extractExplicitSessionKey(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	for _, field := range []string{"prompt_cache_key", "conversation_id", "previous_response_id", "session_id"} {
+		if s := stringField(payload[field]); s != "" {
+			return field + ":" + s
+		}
+	}
+	if conv, ok := payload["conversation"]; ok {
+		if s := stringField(conv); s != "" {
+			return "conversation:" + s
+		}
+		if obj, ok := conv.(map[string]any); ok {
+			if s := stringField(obj["id"]); s != "" {
+				return "conversation:" + s
 			}
-			sum := sha256.Sum256(msg.Content)
-			return requestedModel + "|h:" + hex.EncodeToString(sum[:8])
+		}
+	}
+	if meta, ok := payload["metadata"].(map[string]any); ok {
+		if s := stringField(meta["user_id"]); s != "" {
+			return "meta_user:" + s
+		}
+		if s := stringField(meta["session_id"]); s != "" {
+			return "meta_session:" + s
 		}
 	}
 	return ""
+}
+
+func extractConversationPrefix(chatBody []byte) (firstSys, firstUser string) {
+	if len(chatBody) == 0 {
+		return "", ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(chatBody, &payload); err != nil {
+		return "", ""
+	}
+	msgs, ok := payload["messages"].([]any)
+	if !ok {
+		return "", ""
+	}
+	for _, item := range msgs {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(stringField(m["role"])))
+		text := extractMessageText(m["content"])
+		if text == "" {
+			continue
+		}
+		if len(text) > 2048 {
+			text = text[:2048]
+		}
+		switch role {
+		case "system", "developer":
+			if firstSys == "" {
+				firstSys = text
+			}
+		case "user":
+			if firstUser == "" {
+				firstUser = text
+			}
+		}
+		if firstSys != "" && firstUser != "" {
+			break
+		}
+	}
+	return firstSys, firstUser
+}
+
+func extractMessageText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		var parts []string
+		for _, p := range v {
+			obj, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			if s := stringField(obj["text"]); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	default:
+		return ""
+	}
+}
+
+func stringField(v any) string {
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(s)
 }

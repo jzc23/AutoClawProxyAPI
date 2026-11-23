@@ -224,6 +224,90 @@ func TestGatewayAuthFailoverAndPerAccountProxy(t *testing.T) {
 	}
 }
 
+func TestStickySessionAcrossAllThreeEndpointsAndStreamIncludeUsage(t *testing.T) {
+	var seenAuths []string
+	var seenStreamUsage atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != protocol.PathChat {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		seenAuths = append(seenAuths, r.Header.Get("Authorization"))
+		if isStream, _ := body["stream"].(bool); isStream {
+			if so, ok := body["stream_options"].(map[string]any); ok && so["include_usage"] == true {
+				seenStreamUsage.Store(true)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"id\":\"s1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"s1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","model":"glm-5","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`))
+	}))
+	defer upstream.Close()
+
+	_, handler, _, cfgMgr := setupTestServer(t, upstream.URL)
+	vkey := config.GenerateVKey()
+	_, _ = cfgMgr.Update(func(c *config.Config) error {
+		c.APIKeys = []config.APIKeyItem{{ID: "k1", Name: "主密钥", Key: vkey, Enabled: true}}
+		return nil
+	})
+
+	// 1. /v1/chat/completions 多轮相同前缀应稳定粘在同一账号
+	for _, msg2 := range []string{"第二轮追问", "第三轮追问"} {
+		body := `{"model":"glm-5","messages":[{"role":"system","content":"你是架构师"},{"role":"user","content":"第一轮问题"},{"role":"assistant","content":"好"},{"role":"user","content":"` + msg2 + `"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+		req.Header.Set("Authorization", "Bearer "+vkey)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("chat 请求失败: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	if len(seenAuths) != 2 || seenAuths[0] != seenAuths[1] {
+		t.Fatalf("多轮同前缀 /v1/chat/completions 未保持粘性: %+v", seenAuths)
+	}
+
+	// 2. /v1/responses 携带 prompt_cache_key（流式）连续两次应粘在同一账号，并自动携带 stream_options.include_usage=true
+	seenAuths = nil
+	for i := 0; i < 2; i++ {
+		body := `{"model":"glm-5","stream":true,"prompt_cache_key":"resp-cache-001","input":"hello"}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(body))
+		req.Header.Set("Authorization", "Bearer "+vkey)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("responses 流式请求失败: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	if len(seenAuths) != 2 || seenAuths[0] != seenAuths[1] {
+		t.Fatalf("/v1/responses 显式 prompt_cache_key 未保持粘性: %+v", seenAuths)
+	}
+	if !seenStreamUsage.Load() {
+		t.Fatalf("流式请求未自动补齐 stream_options.include_usage=true")
+	}
+
+	// 3. /v1/messages 携带 metadata.user_id 连续两次应粘在同一账号
+	seenAuths = nil
+	for i := 0; i < 2; i++ {
+		body := `{"model":"glm-5","max_tokens":512,"metadata":{"user_id":"claude-sess-99"},"messages":[{"role":"user","content":"hi"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+		req.Header.Set("x-api-key", vkey)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("anthropic 请求失败: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	if len(seenAuths) != 2 || seenAuths[0] != seenAuths[1] {
+		t.Fatalf("/v1/messages metadata.user_id 未保持粘性: %+v", seenAuths)
+	}
+}
+
 func TestNonStreamKeepaliveWhitespace(t *testing.T) {
 	// 缩短心跳参数便于测试（包级变量，defer 恢复）
 	oldGrace, oldInterval := keepaliveGrace, keepaliveInterval
@@ -241,8 +325,7 @@ func TestNonStreamKeepaliveWhitespace(t *testing.T) {
 	}))
 	defer slowUpstream.Close()
 
-	srvSlow, handlerSlow, _, cfgSlow := setupTestServer(t, slowUpstream.URL)
-	_ = srvSlow
+	_, handlerSlow, _, cfgSlow := setupTestServer(t, slowUpstream.URL)
 	vkey := config.GenerateVKey()
 	if _, err := cfgSlow.Update(func(c *config.Config) error {
 		c.APIKeys = []config.APIKeyItem{{ID: "k1", Name: "主密钥", Key: vkey, Enabled: true}}
@@ -274,8 +357,7 @@ func TestNonStreamKeepaliveWhitespace(t *testing.T) {
 	}))
 	defer fastUpstream.Close()
 
-	srvFast, handlerFast, _, cfgFast := setupTestServer(t, fastUpstream.URL)
-	_ = srvFast
+	_, handlerFast, _, cfgFast := setupTestServer(t, fastUpstream.URL)
 	if _, err := cfgFast.Update(func(c *config.Config) error {
 		c.APIKeys = []config.APIKeyItem{{ID: "k1", Name: "主密钥", Key: vkey, Enabled: true}}
 		return nil

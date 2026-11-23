@@ -151,9 +151,9 @@ func desktopTM() string {
 }
 
 // AttachChatHeaders 设置对话补全专用请求头（第一套独立请求头）。
-// 携带双通道 Bearer、X-Request-Model 与桌面端 mac 指纹；X-Trace-Id 与 x_trace_id
-// 复用同一次生成的 16 位随机十六进制串，不携带任何可被上游按规则批量识别的工具明文标识。
+// 携带双通道 Bearer、X-Request-Model、桌面端 mac 指纹与同源 16 位随机链路标识。
 func AttachChatHeaders(req *http.Request, token, model string) {
+	traceID := RandomHex(16)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("User-Agent", ClientUA)
@@ -163,7 +163,6 @@ func AttachChatHeaders(req *http.Request, token, model string) {
 	req.Header.Set("X-Channel", "official")
 	req.Header.Set("X-Lang", "zh-CN")
 	req.Header.Set("X-Client-Type", "pc")
-	traceID := RandomHex(16)
 	req.Header.Set("X-Trace-Id", traceID)
 	req.Header.Set("x_trace_id", traceID)
 	if b := formatBearer(token); b != "" {
@@ -251,7 +250,6 @@ func JWTExpirySeconds(token string) int64 {
 }
 
 // JWTIssuedAtSeconds 从 JWT 的 iat 字段读取签发 Unix 秒数，无法解析返回 0。
-// 与 exp 配合可推算令牌真实签发周期（国际版 24h / 国内版 28 天）。
 func JWTIssuedAtSeconds(token string) int64 {
 	claims := ParseJWTClaims(token)
 	if claims == nil {
@@ -261,6 +259,20 @@ func JWTIssuedAtSeconds(token string) int64 {
 		return int64(v)
 	}
 	return 0
+}
+
+// JWTTTLSeconds 返回 JWT 令牌的实际签发有效周期（exp - iat，单位秒）；缺少字段时返回 0。
+func JWTTTLSeconds(token string) int64 {
+	claims := ParseJWTClaims(token)
+	if claims == nil {
+		return 0
+	}
+	exp, okExp := claims["exp"].(float64)
+	iat, okIat := claims["iat"].(float64)
+	if !okExp || !okIat || exp <= iat || iat <= 0 {
+		return 0
+	}
+	return int64(exp) - int64(iat)
 }
 
 // JWTUserID 从 JWT 载荷提取常见用户标识字段。

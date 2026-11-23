@@ -13,6 +13,7 @@ import (
 	"autoclaw2api/internal/accounts"
 	"autoclaw2api/internal/config"
 	"autoclaw2api/internal/logging"
+	"autoclaw2api/internal/mihomo"
 	"autoclaw2api/internal/protocol"
 	"autoclaw2api/internal/proxypool"
 	"autoclaw2api/internal/scheduler"
@@ -23,28 +24,46 @@ type oauthSession struct {
 	Provider    protocol.OAuthProvider
 	DeviceID    string
 	NavigateURI string
+	ExitMode    string
+	ProxyID     string
+	MihomoNode  string
+	UsedExit    string
 	ExpiresAt   time.Time
 }
 
-// Server 聚合多协议 AI 网关、代理池与终端极客风 Web 控制台。
+type smsLoginSession struct {
+	Phone      string
+	ExitMode   string
+	ProxyID    string
+	MihomoNode string
+	UsedExit   string
+	ExpiresAt  time.Time
+}
+
+// Server 聚合多协议 AI 网关、代理池、mihomo 登录节点桥与终端极客风 Web 控制台。
 type Server struct {
 	cfgMgr    *config.Manager
 	pool      *accounts.Pool
 	router    *accounts.Router
 	proxyMgr  *proxypool.Manager
+	mihomoMgr *mihomo.Manager
 	scheduler *scheduler.Engine
 	logger    *logging.Logger
 	startedAt time.Time
 
 	oauthMu       sync.Mutex
 	oauthSessions map[string]oauthSession
+	smsSessions   map[string]smsLoginSession
 
 	sessionMu     sync.RWMutex
 	panelSessions map[string]panelSession
 
 	loginGuard *panelLoginGuard
+}
 
-	sticky *stickyTable
+// SetMihomoManager 注入 mihomo 订阅代理桥管理器（供在线下载、订阅解析与测速使用）。
+func (s *Server) SetMihomoManager(m *mihomo.Manager) {
+	s.mihomoMgr = m
 }
 
 // NewServer 构造网关服务实例。
@@ -65,9 +84,9 @@ func NewServer(
 		logger:        logger,
 		startedAt:     time.Now(),
 		oauthSessions: make(map[string]oauthSession),
+		smsSessions:   make(map[string]smsLoginSession),
 		panelSessions: make(map[string]panelSession),
 		loginGuard:    &panelLoginGuard{},
-		sticky:        newStickyTable(),
 	}
 }
 
@@ -106,6 +125,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/admin/accounts/{id}", s.withPanelAuth(s.handleAdminDeleteAccount))
 	mux.HandleFunc("POST /api/admin/accounts/{id}/refresh-token", s.withPanelAuth(s.handleAdminRefreshToken))
 	mux.HandleFunc("POST /api/admin/accounts/{id}/refresh-balance", s.withPanelAuth(s.handleAdminRefreshBalance))
+	mux.HandleFunc("GET /api/admin/accounts/{id}/balance-history", s.withPanelAuth(s.handleAdminAccountBalanceHistory))
+	mux.HandleFunc("DELETE /api/admin/accounts/{id}/balance-history", s.withPanelAuth(s.handleAdminClearAccountBalanceHistory))
+	mux.HandleFunc("GET /api/admin/balance-history", s.withPanelAuth(s.handleAdminBalanceHistory))
 	mux.HandleFunc("PUT /api/admin/accounts/{id}/proxy", s.withPanelAuth(s.handleAdminAccountProxyBinding))
 
 	// 独立 API Key 管理（一键随机生成 vKey-）
@@ -123,6 +145,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/admin/proxies/{id}", s.withPanelAuth(s.handleAdminProxyUpdate))
 	mux.HandleFunc("DELETE /api/admin/proxies/{id}", s.withPanelAuth(s.handleAdminProxyDelete))
 	mux.HandleFunc("POST /api/admin/proxies/{id}/probe", s.withPanelAuth(s.handleAdminProxyProbeOne))
+
+	// mihomo 内核在线下载与机场订阅代理桥
+	mux.HandleFunc("GET /api/admin/mihomo/status", s.withPanelAuth(s.handleAdminMihomoStatus))
+	mux.HandleFunc("POST /api/admin/mihomo/download", s.withPanelAuth(s.handleAdminMihomoDownloadStart))
+	mux.HandleFunc("GET /api/admin/mihomo/download/progress", s.withPanelAuth(s.handleAdminMihomoDownloadProgress))
+	mux.HandleFunc("PUT /api/admin/mihomo/config", s.withPanelAuth(s.handleAdminMihomoConfigUpdate))
+	mux.HandleFunc("POST /api/admin/mihomo/refresh", s.withPanelAuth(s.handleAdminMihomoRefresh))
+	mux.HandleFunc("POST /api/admin/mihomo/probe", s.withPanelAuth(s.handleAdminMihomoProbe))
 
 	// 签到与任务
 	mux.HandleFunc("POST /api/admin/checkin/run", s.withPanelAuth(s.handleAdminCheckinRun))

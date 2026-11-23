@@ -243,7 +243,7 @@ func ExchangeOAuthCode(ctx context.Context, client *http.Client, baseURL string,
 	}
 	bizCode, msg, data := unpackLoginEnvelope(raw)
 	if bizCode != 0 {
-		return nil, errors.New(explainOAuthExchangeBizError(bizCode, msg))
+		return nil, errors.New(explainOAuthCallbackBizError(bizCode, msg))
 	}
 	return decodeLoginAccount(data, RegionGlobal, deviceID)
 }
@@ -375,71 +375,66 @@ func decodeLoginAccount(data json.RawMessage, region Region, deviceID string) (*
 	}, nil
 }
 
-func explainLoginBizError(isOAuth bool, code int64, upstreamMsg string) string {
+func formatUpstreamBizDetail(code int64, upstreamMsg string) string {
+	msg := strings.TrimSpace(upstreamMsg)
+	if msg != "" {
+		return fmt.Sprintf("（code=%d，%s）", code, msg)
+	}
+	return fmt.Sprintf("（code=%d）", code)
+}
+
+// explainOAuthCallbackBizError 专门解释国际版 OAuth 第二步换票阶段的业务错误，保留上游原始 code 与 msg。
+func explainOAuthCallbackBizError(code int64, upstreamMsg string) string {
+	detail := formatUpstreamBizDetail(code, upstreamMsg)
 	switch code {
 	case 400002:
-		return "请求签名校验失败（请检查本机系统时间是否准确）"
+		return "换票阶段请求签名校验失败（请检查本机系统时间是否准确）" + detail
+	case 630014:
+		return "换票阶段触发上游风控/审核未通过，请确认浏览器授权与网关出口 IP 一致或更换节点后重试" + detail
+	case 631001:
+		return "回调授权码无效或已过期，请重新发起授权" + detail
+	case BizCodeNotLoggedIn, BizCodeAuthExpired:
+		return "登录状态已失效，请重新发起授权" + detail
+	}
+	return "OAuth 换票登录失败" + detail
+}
+
+func explainLoginBizError(isOAuth bool, code int64, upstreamMsg string) string {
+	detail := formatUpstreamBizDetail(code, upstreamMsg)
+	switch code {
+	case 400002:
+		return "请求签名校验失败（请检查本机系统时间是否准确）" + detail
 	case 631002:
 		if isOAuth {
-			return "风控滑块验证未通过或已过期，请重新完成人机验证"
+			return "风控滑块验证未通过或已过期，请重新完成人机验证" + detail
 		}
-		return "上游要求过风控验证，建议改用「导入凭证 JSON」方式添加"
+		return "上游要求过风控验证，建议改用「导入凭证 JSON」方式添加" + detail
 	case 630014:
 		if isOAuth {
-			return "人机验证未通过，请重新滑动验证"
+			return "人机验证未通过，请重新滑动验证" + detail
 		}
-		return "触发上游风控校验，请稍后重试或改用凭证 JSON 导入"
+		return "触发上游风控校验，请稍后重试或改用凭证 JSON 导入" + detail
 	case 631001:
 		if isOAuth {
-			return "回调授权码无效或已过期，请重新发起授权"
+			return "回调授权码无效或已过期，请重新发起授权" + detail
 		}
 	case 400001:
 		if !isOAuth {
-			return "请求参数有误，请检查手机号与 6 位数字验证码"
+			return "请求参数有误，请检查手机号与 6 位数字验证码" + detail
 		}
 	case 630202:
 		if !isOAuth {
-			return "短信验证码不正确，请核对后重试"
+			return "短信验证码不正确，请核对后重试" + detail
 		}
 	case 630101:
 		if !isOAuth {
-			return "短信验证码发送过于频繁，请稍后再试"
+			return "短信验证码发送过于频繁，请稍后再试" + detail
 		}
 	case BizCodeNotLoggedIn, BizCodeAuthExpired:
-		return "登录状态已失效，请重新登录"
+		return "登录状态已失效，请重新登录" + detail
 	}
 	if msg := strings.TrimSpace(upstreamMsg); msg != "" {
-		return "登录失败：" + msg
+		return "登录失败：" + msg + fmt.Sprintf("（code=%d）", code)
 	}
 	return fmt.Sprintf("登录失败（上游业务码 %d）", code)
-}
-
-// explainOAuthExchangeBizError 解释国际版 OAuth 第二步（code/state 换票）阶段的业务码。
-// 该阶段不涉及滑块验证，上游同样可能返回 630014（换票风控/审核未通过），不能复用第一步的
-// 「人机验证未通过」文案误导用户重试滑块，因此单独拆分并在报错中保留上游原始 code 与 msg。
-func explainOAuthExchangeBizError(code int64, upstreamMsg string) string {
-	hint := ""
-	switch code {
-	case 400002:
-		hint = "请求签名校验失败（请检查本机系统时间是否准确）"
-	case 630014:
-		hint = "换票阶段触发上游风控/审核未通过（常见于同 IP 连续登录多个新账号或浏览器与换票出口 IP 不一致），并非滑块验证问题，请稍后更换网络环境重试"
-	case 631001:
-		hint = "回调授权码无效或已过期，请重新发起授权"
-	case 631002:
-		hint = "上游要求过风控验证，请稍后重试"
-	case BizCodeNotLoggedIn, BizCodeAuthExpired:
-		hint = "登录状态已失效，请重新登录"
-	}
-	msg := strings.TrimSpace(upstreamMsg)
-	switch {
-	case hint != "" && msg != "":
-		return fmt.Sprintf("%s（code=%d，%s）", hint, code, msg)
-	case hint != "":
-		return fmt.Sprintf("%s（code=%d）", hint, code)
-	case msg != "":
-		return fmt.Sprintf("换票失败（code=%d，%s）", code, msg)
-	default:
-		return fmt.Sprintf("换票失败（上游业务码 %d）", code)
-	}
 }

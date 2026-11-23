@@ -38,12 +38,15 @@ type Account struct {
 	LastError     string
 	Balance       float64
 	BalanceKnown  bool
-	BalanceAt     time.Time
-	LastCheckin   string // YYYY-MM-DD
-	CheckinStatus string // done | already | failed | pending
-	CheckinMsg    string
-	TotalRequests int64
-	FailedCount   int64
+	BalanceAt       time.Time
+	LastCheckin       string // YYYY-MM-DD
+	LastCheckinAt     time.Time
+	LastCheckinPoints int64
+	CheckinStatus     string // done | already | failed | pending
+	CheckinMsg      string
+	TotalRequests   int64
+	LastBalanceReqs int64
+	FailedCount     int64
 }
 
 // EffectiveStatus 计算账号在指定时刻的实时状态。
@@ -105,27 +108,51 @@ type PoolStats struct {
 	TotalBalance float64 `json:"total_balance"`
 }
 
-// Pool 管理任意数量的国内版与国际版账号，支持目录热更新、轮询调度与故障冷却。
+const (
+	defaultStickyTTL = 15 * time.Minute
+	maxStickyEntries = 4096
+)
+
+type stickyBinding struct {
+	accountID string
+	expiresAt time.Time
+}
+
+// Pool 管理任意数量的国内版与国际版账号，支持目录热更新、轮询调度、短时会话粘性与故障冷却。
 type Pool struct {
-	mu      sync.RWMutex
-	cfgMgr  *config.Manager
-	logger  *logging.Logger
-	items   map[string]*Account
-	order   []string
-	rrIndex map[string]uint64
+	mu               sync.RWMutex
+	cfgMgr           *config.Manager
+	logger           *logging.Logger
+	items            map[string]*Account
+	order            []string
+	rrIndex          map[string]uint64
+	sticky           map[string]stickyBinding
+	stickyTTL        time.Duration
+	balanceSnapshots map[string]BalanceSnapshot
+	balanceUsage     map[string][]BalanceChangeRecord
+	balanceEvents    map[string][]BalanceChangeRecord
+	balanceSeq       int64
 }
 
 // NewPool 创建多账号池并立刻从凭证目录完成首次扫描加载。
 func NewPool(cfgMgr *config.Manager, logger *logging.Logger) (*Pool, error) {
 	p := &Pool{
-		cfgMgr:  cfgMgr,
-		logger:  logger,
-		items:   make(map[string]*Account),
-		rrIndex: make(map[string]uint64),
+		cfgMgr:           cfgMgr,
+		logger:           logger,
+		items:            make(map[string]*Account),
+		rrIndex:          make(map[string]uint64),
+		sticky:           make(map[string]stickyBinding),
+		stickyTTL:        defaultStickyTTL,
+		balanceSnapshots: make(map[string]BalanceSnapshot),
+		balanceUsage:     make(map[string][]BalanceChangeRecord),
+		balanceEvents:    make(map[string][]BalanceChangeRecord),
 	}
 	if err := p.SyncFromDisk(); err != nil {
 		return nil, err
 	}
+	p.mu.Lock()
+	p.loadBalanceHistoryLocked()
+	p.mu.Unlock()
 	return p, nil
 }
 
@@ -232,10 +259,44 @@ func (p *Pool) rebuildOrderLocked() {
 
 // Acquire 按轮询策略选择一个可用的就绪账号（region 为空表示双区联合调度，exclude 用于单请求故障切号避让）。
 func (p *Pool) Acquire(region protocol.Region, exclude map[string]bool) (*Account, bool) {
+	return p.AcquireSticky(region, "", exclude)
+}
+
+// AcquireSticky 支持按会话粘性键优先命中已绑定的就绪账号（15 分钟滑动有效期，提升上游 Prompt Cache 命中率）；
+// 若已绑定账号处于冷却/失效/被排除，则自动轮询切号并改绑至新账号。
+func (p *Pool) AcquireSticky(region protocol.Region, stickyKey string, exclude map[string]bool) (*Account, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	now := time.Now()
+	ttl := p.stickyTTL
+	if ttl <= 0 {
+		ttl = defaultStickyTTL
+	}
+	key := strings.TrimSpace(stickyKey)
+
+	if key != "" {
+		if b, ok := p.sticky[key]; ok {
+			if now.Before(b.expiresAt) {
+				if exclude == nil || !exclude[b.accountID] {
+					if acc, exists := p.items[b.accountID]; exists &&
+						(region == "" || acc.Cred.Region == region) &&
+						acc.EffectiveStatus(now) == StatusOnline {
+						p.sticky[key] = stickyBinding{
+							accountID: acc.ID,
+							expiresAt: now.Add(ttl),
+						}
+						acc.TotalRequests++
+						snap := *acc
+						return &snap, true
+					}
+				}
+			} else {
+				delete(p.sticky, key)
+			}
+		}
+	}
+
 	candidates := make([]*Account, 0, len(p.order))
 	for _, id := range p.order {
 		if exclude != nil && exclude[id] {
@@ -263,31 +324,68 @@ func (p *Pool) Acquire(region protocol.Region, exclude map[string]bool) (*Accoun
 
 	chosen := candidates[idx]
 	chosen.TotalRequests++
+	if key != "" {
+		p.pruneStickyLocked(now)
+		p.sticky[key] = stickyBinding{
+			accountID: chosen.ID,
+			expiresAt: now.Add(ttl),
+		}
+	}
 	snap := *chosen
 	return &snap, true
 }
 
-// AcquireSpecific 优先获取指定的账号（供会话粘性调度使用），仅当该账号存在、
-// 属于目标区域、未被排除且处于在线就绪状态时成功；语义与 Acquire 一致（计数请求并返回快照）。
-func (p *Pool) AcquireSpecific(region protocol.Region, id string, exclude map[string]bool) (*Account, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if exclude != nil && exclude[id] {
-		return nil, false
+// StickyAccountRegion 查询会话粘性键当前有效绑定的在线账号所在区域（用于跨区别名优先命中粘性区域）。
+func (p *Pool) StickyAccountRegion(stickyKey string, exclude map[string]bool) (protocol.Region, bool) {
+	key := strings.TrimSpace(stickyKey)
+	if key == "" {
+		return "", false
 	}
-	acc, ok := p.items[id]
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	b, ok := p.sticky[key]
 	if !ok {
-		return nil, false
+		return "", false
 	}
-	if region != "" && acc.Cred.Region != region {
-		return nil, false
+	now := time.Now()
+	if !now.Before(b.expiresAt) {
+		return "", false
 	}
-	if acc.EffectiveStatus(time.Now()) != StatusOnline {
-		return nil, false
+	if exclude != nil && exclude[b.accountID] {
+		return "", false
 	}
-	acc.TotalRequests++
-	snap := *acc
-	return &snap, true
+	acc, exists := p.items[b.accountID]
+	if !exists || acc.EffectiveStatus(now) != StatusOnline {
+		return "", false
+	}
+	return acc.Cred.Region, true
+}
+
+func (p *Pool) pruneStickyLocked(now time.Time) {
+	if len(p.sticky) < maxStickyEntries {
+		return
+	}
+	// 先惰性清理全部过期条目
+	for k, b := range p.sticky {
+		if !now.Before(b.expiresAt) {
+			delete(p.sticky, k)
+		}
+	}
+	// 若仍达到上限，淘汰最早过期的条目，控制内存占用有界
+	for len(p.sticky) >= maxStickyEntries {
+		var oldestKey string
+		var oldestExp time.Time
+		for k, b := range p.sticky {
+			if oldestKey == "" || b.expiresAt.Before(oldestExp) {
+				oldestKey = k
+				oldestExp = b.expiresAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(p.sticky, oldestKey)
+	}
 }
 
 // ReportSuccess 标记账号本次调用成功，清理残余错误状态。
@@ -543,25 +641,39 @@ func (p *Pool) ApplyRefreshedTokens(id, accessToken, refreshToken string, expire
 	return nil
 }
 
-// UpdateBalance 更新内存中的账号积分余额缓存。
+// UpdateBalance 更新内存中的账号积分余额缓存并记录变动审计日志（默认触发源 manual）。
 func (p *Pool) UpdateBalance(id string, balance float64) {
+	p.UpdateBalanceWithTrigger(id, balance, "manual")
+}
+
+// UpdateBalanceWithTrigger 更新账号积分余额并按触发来源执行自动归因审计与持久化。
+func (p *Pool) UpdateBalanceWithTrigger(id string, balance float64, trigger string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if acc, ok := p.items[id]; ok {
-		acc.Balance = balance
-		acc.BalanceKnown = true
-		acc.BalanceAt = time.Now()
+		p.applyBalanceUpdateLocked(acc, balance, trigger)
 	}
 }
 
 // UpdateCheckinState 记录账号今日签到状态。
 func (p *Pool) UpdateCheckinState(id, dateStr, status, msg string) {
+	p.UpdateCheckinStateWithPoints(id, dateStr, status, msg, 0)
+}
+
+// UpdateCheckinStateWithPoints 记录账号今日签到状态及本次签到奖励积分（供后续余额变动精准归因）。
+func (p *Pool) UpdateCheckinStateWithPoints(id, dateStr, status, msg string, points int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if acc, ok := p.items[id]; ok {
 		acc.LastCheckin = dateStr
 		acc.CheckinStatus = status
 		acc.CheckinMsg = msg
+		if status == "done" {
+			acc.LastCheckinAt = time.Now()
+			if points > 0 {
+				acc.LastCheckinPoints = points
+			}
+		}
 	}
 }
 
@@ -627,6 +739,7 @@ func (p *Pool) Delete(id string) error {
 	}
 	filePath := acc.FilePath
 	delete(p.items, id)
+	p.deleteBalanceHistoryLocked(id)
 	p.rebuildOrderLocked()
 	p.mu.Unlock()
 

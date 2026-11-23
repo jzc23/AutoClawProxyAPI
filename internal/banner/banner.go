@@ -40,7 +40,7 @@ func Render(info Info) string {
 	}
 	ver := strings.TrimSpace(info.Version)
 	if ver == "" {
-		ver = "v1.0.0"
+		ver = "v1.1.0"
 	}
 
 	checkinText := "未开启"

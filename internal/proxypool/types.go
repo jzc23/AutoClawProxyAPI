@@ -10,7 +10,8 @@ const (
 	ModeInherit = "inherit" // 继承所属区域（CN / Global）默认出口
 	ModeDirect  = "direct"  // 强制直连
 	ModePool    = "pool"    // 从代理池健康节点自动分配
-	ModeFixed   = "fixed"   // 固定绑定某一个代理节点（一号一代理）
+	ModeFixed   = "fixed"   // 固定绑定单个自备标准代理节点（一号一代理）
+	ModeMihomo  = "mihomo"  // 固定绑定单个 mihomo 机场订阅节点（一号一代理）
 )
 
 // 节点健康状态常量。
@@ -39,11 +40,12 @@ type Node struct {
 
 // Binding 描述账号级或区域级的出口绑定配置。
 type Binding struct {
-	Mode    string `json:"mode"`
-	ProxyID string `json:"proxy_id,omitempty"`
+	Mode       string `json:"mode"`
+	ProxyID    string `json:"proxy_id,omitempty"`
+	MihomoNode string `json:"mihomo_node,omitempty"`
 }
 
-// Normalize 规范化绑定结构。
+// Normalize 规范化日常代理绑定结构（账号与区域日常出站仅支持 inherit / direct / pool / fixed，不强绑 mihomo 登录节点）。
 func (b Binding) Normalize(allowInherit bool) Binding {
 	mode := strings.ToLower(strings.TrimSpace(b.Mode))
 	switch mode {
@@ -142,13 +144,15 @@ type ImportSummary struct {
 
 // RouteInfo 描述某个账号最终解析出的出口说明（供账号列表展示与日志追踪）。
 type RouteInfo struct {
-	AccountMode   string `json:"account_mode"`             // inherit | direct | pool | fixed
-	AccountNodeID string `json:"account_proxy_id,omitempty"`
-	EffectiveMode string `json:"effective_mode"`           // direct | pool | fixed
-	NodeID        string `json:"node_id,omitempty"`
-	NodeName      string `json:"node_name,omitempty"`
-	NodeMaskedURL string `json:"node_masked_url,omitempty"`
-	Summary       string `json:"summary"`
+	AccountMode       string `json:"account_mode"`                    // inherit | direct | pool | fixed | mihomo
+	AccountNodeID     string `json:"account_proxy_id,omitempty"`
+	AccountMihomoNode string `json:"account_mihomo_node,omitempty"`
+	EffectiveMode     string `json:"effective_mode"`                  // direct | pool | fixed | mihomo
+	NodeID            string `json:"node_id,omitempty"`
+	NodeName          string `json:"node_name,omitempty"`
+	NodeMaskedURL     string `json:"node_masked_url,omitempty"`
+	MihomoNode        string `json:"mihomo_node,omitempty"`
+	Summary           string `json:"summary"`
 }
 
 // Snapshot 汇总代理池全部对外状态。

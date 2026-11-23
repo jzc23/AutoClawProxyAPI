@@ -1,4 +1,4 @@
-# 编译产物与发布包
+# 编译产物、外置内核与发布包
 *.exe
 *.dll
 *.so
@@ -6,6 +6,9 @@
 *.test
 *.out
 autoclaw2api
+mihomo
+mihomo.exe
+*.part
 dist/
 bin/
 build/
@@ -15,6 +18,8 @@ build/
 config.json
 proxies.json
 proxypool.json
+mihomo_bridge.json
+balance_history.json
 state.json
 auths/
 data/

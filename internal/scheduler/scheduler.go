@@ -2,10 +2,11 @@ package scheduler
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand/v2"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,13 +19,18 @@ import (
 	"autoclaw2api/internal/proxypool"
 )
 
-const maxCheckinHistory = 500
-
-// 令牌自动续期的失败退避区间：15m → 30m → 1h → 2h → 4h → 8h → 12h（封顶）。
 const (
-	refreshRetryBase    = 15 * time.Minute
-	refreshRetryMaxBack = 12 * time.Hour
+	maxCheckinHistory    = 500
+	refreshBackoffBase   = 15 * time.Minute
+	refreshBackoffMax    = 12 * time.Hour
+	balanceRefreshConc   = 2
+	balanceRefreshPeriod = 30 * time.Minute
 )
+
+type refreshBackoffState struct {
+	failures  int
+	nextRetry time.Time
+}
 
 // CheckinRecord 记录一次账号签到的详细历史。
 type CheckinRecord struct {
@@ -40,12 +46,6 @@ type CheckinRecord struct {
 	Source         string          `json:"source"` // auto | manual
 }
 
-// refreshFailure 记录账号令牌自动续期的连续失败次数与下次允许重试的时间（按账号维度指数退避）。
-type refreshFailure struct {
-	fails  int
-	nextAt time.Time
-}
-
 // Engine 驱动 Token 自动续期、每日定时签到、余额同步与凭证目录热重载。
 type Engine struct {
 	cfgMgr   *config.Manager
@@ -58,22 +58,33 @@ type Engine struct {
 	history        []CheckinRecord
 	lastAutoDay    string
 	runningCheckin bool
-	refreshFails   map[string]refreshFailure
+	refreshBackoff map[string]refreshBackoffState
+	checkinStagger func() time.Duration
 }
 
 // New 创建后台调度引擎并加载持久化的签到历史。
 func New(cfgMgr *config.Manager, pool *accounts.Pool, router *accounts.Router, proxyMgr *proxypool.Manager, logger *logging.Logger) *Engine {
 	e := &Engine{
-		cfgMgr:       cfgMgr,
-		pool:         pool,
-		router:       router,
-		proxyMgr:     proxyMgr,
-		logger:       logger,
-		history:      make([]CheckinRecord, 0, 64),
-		refreshFails: make(map[string]refreshFailure),
+		cfgMgr:         cfgMgr,
+		pool:           pool,
+		router:         router,
+		proxyMgr:       proxyMgr,
+		logger:         logger,
+		history:        make([]CheckinRecord, 0, 64),
+		refreshBackoff: make(map[string]refreshBackoffState),
+		checkinStagger: defaultCheckinStagger,
 	}
 	e.loadHistory()
 	return e
+}
+
+func defaultCheckinStagger() time.Duration {
+	// 3~10 秒随机错峰，避免多号同一秒并发签到触发风控
+	n, err := rand.Int(rand.Reader, big.NewInt(7001))
+	if err != nil {
+		return 5 * time.Second
+	}
+	return 3*time.Second + time.Duration(n.Int64())*time.Millisecond
 }
 
 func (e *Engine) historyFilePath() string {
@@ -89,30 +100,25 @@ func (e *Engine) loadHistory() {
 	if err := json.Unmarshal(raw, &records); err != nil {
 		return
 	}
-	e.mu.Lock()
-	e.history = records
-	e.mu.Unlock()
-
-	// 回填今日账号签到状态到内存池中；当日已存在自动签到记录时恢复 lastAutoDay，
-	// 避免每天签到时间点之后重启服务会在 1 分钟内重复触发一轮全量自动签到
 	today := time.Now().Format("2006-01-02")
-	autoToday := false
-	for _, r := range records {
+	autoRanToday := false
+	// history 按时间倒序存储，从旧到新回填确保每个账号保留当日最新状态
+	for i := len(records) - 1; i >= 0; i-- {
+		r := records[i]
 		if r.Date == today {
 			e.pool.UpdateCheckinState(r.AccountID, r.Date, r.Status, r.Message)
 			if r.Source == "auto" {
-				autoToday = true
+				autoRanToday = true
 			}
 		}
 	}
-	if autoToday {
-		e.mu.Lock()
+
+	e.mu.Lock()
+	e.history = records
+	if autoRanToday {
 		e.lastAutoDay = today
-		e.mu.Unlock()
-		if e.logger != nil {
-			e.logger.Info("Checkin", "检测到今日已执行过自动签到，重启后不再重复触发")
-		}
 	}
+	e.mu.Unlock()
 }
 
 func (e *Engine) appendHistory(rec CheckinRecord) {
@@ -148,21 +154,19 @@ func (e *Engine) History(limit int) []CheckinRecord {
 
 // Start 启动后台定时调度协程。
 func (e *Engine) Start(ctx context.Context) {
-	// 启动后异步预热：模型目录与余额各自限时，避免其中一个耗尽超时预算拖垮另一个
+	// 启动后异步预热：实时同步双区模型目录并拉取一次余额
 	go func() {
-		modelsCtx, cancelModels := context.WithTimeout(ctx, 45*time.Second)
-		_ = e.router.RefreshAllModels(modelsCtx)
-		cancelModels()
-		balanceCtx, cancelBalance := context.WithTimeout(ctx, 60*time.Second)
-		e.RefreshAllBalances(balanceCtx)
-		cancelBalance()
+		warmupCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+		_ = e.router.RefreshAllModels(warmupCtx)
+		e.RefreshAllBalancesWithTrigger(warmupCtx, "startup")
 	}()
 
 	go func() {
 		syncTicker := time.NewTicker(30 * time.Second)
 		refreshTicker := time.NewTicker(15 * time.Minute)
 		modelTicker := time.NewTicker(30 * time.Minute)
-		balanceTicker := time.NewTicker(30 * time.Minute)
+		balanceTicker := time.NewTicker(balanceRefreshPeriod)
 		defer syncTicker.Stop()
 		defer refreshTicker.Stop()
 		defer modelTicker.Stop()
@@ -185,7 +189,12 @@ func (e *Engine) Start(ctx context.Context) {
 				_ = e.router.RefreshAllModels(probeCtx)
 				cancel()
 			case <-balanceTicker.C:
-				e.refreshBalancesPeriodic(ctx)
+				if !e.hasBalanceRefreshCandidates() {
+					continue
+				}
+				balCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+				_ = e.RefreshAllBalancesWithTrigger(balCtx, "auto")
+				cancel()
 			}
 		}
 	}()
@@ -215,90 +224,105 @@ func (e *Engine) maybeRunDailyCheckin(ctx context.Context) {
 		e.logger.Info("Checkin", "到达每日自动签到时间（%s），开始执行全量签到任务", cfg.Checkin.Time)
 	}
 	go func() {
-		// 多账号自动签到带 3~10 秒随机错峰，账号较多时总耗时会显著增加，放宽到 10 分钟
-		runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 		e.CheckinAll(runCtx, "auto")
 	}()
 }
 
-func (e *Engine) refreshExpiringTokens(ctx context.Context) {
-	now := time.Now().Unix()
-	all := e.pool.AllAccounts()
-
-	// 清理已不存在账号的退避记录，避免 map 随账号增删缓慢膨胀
-	valid := make(map[string]struct{}, len(all))
-	for _, acc := range all {
-		valid[acc.ID] = struct{}{}
-	}
-	e.mu.Lock()
-	for id := range e.refreshFails {
-		if _, ok := valid[id]; !ok {
-			delete(e.refreshFails, id)
+// calcRefreshThresholdSeconds 根据 JWT 真实签发周期动态计算提前续期窗口（秒）：
+//   - 短效令牌（ttl <= 48h，如国际版 24h JWT）：剩余 <= max(2h, ttl/6) 时才续期（24h 令牌即剩余 4h 续期）；
+//   - 长效令牌（ttl > 48h，如国内版 28 天）：保持提前 3 天（72h）；
+//   - 无法解析 iat 时：国际区回落 4h，国内区回落 72h。
+func calcRefreshThresholdSeconds(acc accounts.Account) int64 {
+	const (
+		shortTTLBoundary int64 = 48 * 3600
+		minShortWindow   int64 = 2 * 3600
+		globalFallback   int64 = 4 * 3600
+		longWindow       int64 = 3 * 24 * 3600
+	)
+	ttl := protocol.JWTTTLSeconds(acc.Cred.AccessToken)
+	if ttl > 0 {
+		if ttl <= shortTTLBoundary {
+			w := ttl / 6
+			if w < minShortWindow {
+				w = minShortWindow
+			}
+			return w
 		}
+		return longWindow
 	}
-	e.mu.Unlock()
+	if acc.Cred.Region.IsGlobal() {
+		return globalFallback
+	}
+	return longWindow
+}
 
-	for _, acc := range all {
+func calcRefreshBackoffDelay(failures int) time.Duration {
+	if failures <= 1 {
+		return refreshBackoffBase
+	}
+	shift := failures - 1
+	if shift > 8 {
+		shift = 8
+	}
+	d := refreshBackoffBase << shift
+	if d > refreshBackoffMax || d <= 0 {
+		return refreshBackoffMax
+	}
+	return d
+}
+
+func (e *Engine) shouldSkipRefreshBackoff(accountID string, now time.Time) bool {
+	e.mu.RLock()
+	st, ok := e.refreshBackoff[accountID]
+	e.mu.RUnlock()
+	return ok && now.Before(st.nextRetry)
+}
+
+func (e *Engine) recordRefreshFailure(accountID string, now time.Time) time.Duration {
+	e.mu.Lock()
+	st := e.refreshBackoff[accountID]
+	st.failures++
+	delay := calcRefreshBackoffDelay(st.failures)
+	st.nextRetry = now.Add(delay)
+	e.refreshBackoff[accountID] = st
+	e.mu.Unlock()
+	return delay
+}
+
+func (e *Engine) resetRefreshBackoff(accountID string) {
+	e.mu.Lock()
+	delete(e.refreshBackoff, accountID)
+	e.mu.Unlock()
+}
+
+func (e *Engine) refreshExpiringTokens(ctx context.Context) {
+	nowTime := time.Now()
+	now := nowTime.Unix()
+	for _, acc := range e.pool.AllAccounts() {
 		if acc.Cred.Disabled || acc.Cred.RefreshToken == "" {
 			continue
 		}
-		needRefresh := acc.SessionDead || (acc.Cred.ExpiresAt > 0 && acc.Cred.ExpiresAt-now <= e.tokenRefreshThreshold(&acc))
-		if !needRefresh {
+		if e.shouldSkipRefreshBackoff(acc.ID, nowTime) {
 			continue
 		}
-		// 失败指数退避：未到下次允许重试时间则跳过，避免每 15 分钟对同一账号死循环重试刷新接口
-		e.mu.RLock()
-		rf, hasFail := e.refreshFails[acc.ID]
-		e.mu.RUnlock()
-		if hasFail && time.Now().Before(rf.nextAt) {
+		threshold := calcRefreshThresholdSeconds(acc)
+		needRefresh := acc.SessionDead || (acc.Cred.ExpiresAt > 0 && acc.Cred.ExpiresAt-now <= threshold)
+		if !needRefresh {
 			continue
 		}
 		runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		if err := e.RefreshAccountToken(runCtx, acc.ID); err != nil {
-			e.mu.Lock()
-			cur := e.refreshFails[acc.ID]
-			cur.fails++
-			delay := refreshRetryBase << min(cur.fails-1, 6)
-			if delay > refreshRetryMaxBack {
-				delay = refreshRetryMaxBack
-			}
-			cur.nextAt = time.Now().Add(delay)
-			e.refreshFails[acc.ID] = cur
-			e.mu.Unlock()
+			delay := e.recordRefreshFailure(acc.ID, time.Now())
 			if e.logger != nil {
-				e.logger.Warn("Scheduler", "账号 %s 自动续期失败（第 %d 次，%.0f 分钟后重试）: %v",
-					acc.Cred.DisplayLabel(), cur.fails, delay.Minutes(), err)
+				e.logger.Warn("Scheduler", "账号 %s 自动续期失败（%s 后重试）: %v", acc.Cred.DisplayLabel(), delay, err)
 			}
-		} else {
-			e.mu.Lock()
-			delete(e.refreshFails, acc.ID)
-			e.mu.Unlock()
-			if e.logger != nil {
-				e.logger.Info("Scheduler", "账号 %s Token 自动续期成功", acc.Cred.DisplayLabel())
-			}
+		} else if e.logger != nil {
+			e.logger.Info("Scheduler", "账号 %s Token 自动续期成功", acc.Cred.DisplayLabel())
 		}
 		cancel()
 	}
-}
-
-// tokenRefreshThreshold 依据令牌真实签发周期（exp - iat）动态计算提前续期窗口：
-//   - 短效令牌（ttl <= 48h，如国际版 24h）：剩余 <= max(2h, ttl/6) 时才续期（24h 令牌即剩余 4h 续期，约每 20 小时续一次）；
-//   - 长效令牌（如国内版 28 天）或无法解析时：沿用提前 3 天（72h）的保守窗口。
-func (e *Engine) tokenRefreshThreshold(acc *accounts.Account) int64 {
-	exp := acc.Cred.ExpiresAt
-	iat := protocol.JWTIssuedAtSeconds(acc.Cred.AccessToken)
-	if exp > 0 && iat > 0 && exp > iat {
-		ttl := exp - iat
-		if ttl <= int64((48 * time.Hour).Seconds()) {
-			window := ttl / 6
-			if window < int64((2 * time.Hour).Seconds()) {
-				window = int64((2 * time.Hour).Seconds())
-			}
-			return window
-		}
-	}
-	return int64((3 * 24 * time.Hour).Seconds())
 }
 
 func (e *Engine) baseURLFor(region protocol.Region) string {
@@ -329,11 +353,20 @@ func (e *Engine) RefreshAccountToken(ctx context.Context, id string) error {
 		}
 		return err
 	}
-	return e.pool.ApplyRefreshedTokens(id, res.AccessToken, res.RefreshToken, res.ExpiresAt)
+	if err := e.pool.ApplyRefreshedTokens(id, res.AccessToken, res.RefreshToken, res.ExpiresAt); err != nil {
+		return err
+	}
+	e.resetRefreshBackoff(id)
+	return nil
 }
 
-// RefreshAccountBalance 查询并缓存单个账号的积分余额。
+// RefreshAccountBalance 查询并缓存单个账号的积分余额（默认触发源 manual）。
 func (e *Engine) RefreshAccountBalance(ctx context.Context, id string) (float64, error) {
+	return e.RefreshAccountBalanceWithTrigger(ctx, id, "manual")
+}
+
+// RefreshAccountBalanceWithTrigger 查询并缓存单个账号的积分余额，并记录变动审计触发来源。
+func (e *Engine) RefreshAccountBalanceWithTrigger(ctx context.Context, id, trigger string) (float64, error) {
 	acc, ok := e.pool.GetByID(id)
 	if !ok {
 		return 0, fmt.Errorf("账号不存在: %s", id)
@@ -352,38 +385,29 @@ func (e *Engine) RefreshAccountBalance(ctx context.Context, id string) (float64,
 		}
 		return 0, err
 	}
-	e.pool.UpdateBalance(id, bal)
+	e.pool.UpdateBalanceWithTrigger(id, bal, trigger)
 	return bal, nil
 }
 
-// refreshBalancesPeriodic 后台周期性刷新余额：日常调用扣积分后控制台余额可自动跟进。
-// 当没有任何未停用、未失效且不在冷却中的账号时直接跳过，避免空转请求。
-func (e *Engine) refreshBalancesPeriodic(ctx context.Context) {
-	now := time.Now()
-	hasActive := false
+func (e *Engine) hasBalanceRefreshCandidates() bool {
 	for _, acc := range e.pool.AllAccounts() {
-		if acc.Cred.Disabled || acc.SessionDead {
-			continue
+		if !acc.Cred.Disabled && !acc.SessionDead {
+			return true
 		}
-		if !acc.CooldownUntil.IsZero() && now.Before(acc.CooldownUntil) {
-			continue
-		}
-		hasActive = true
-		break
 	}
-	if !hasActive {
-		return
-	}
-	if n := e.RefreshAllBalances(ctx); n > 0 && e.logger != nil {
-		e.logger.Info("Scheduler", "后台定时余额刷新完成，共更新 %d 个账号", n)
-	}
+	return false
 }
 
-// RefreshAllBalances 并发查询所有启用账号的积分余额（并发收敛至 2，避免多账号同出口 IP 瞬时突发）。
+// RefreshAllBalances 并发查询所有启用账号的积分余额（并发上限收敛为 2，避免同出口 IP 突发请求）。
 func (e *Engine) RefreshAllBalances(ctx context.Context) int {
+	return e.RefreshAllBalancesWithTrigger(ctx, "manual")
+}
+
+// RefreshAllBalancesWithTrigger 并发查询所有启用账号的积分余额，并附带触发来源用于余额变动归因。
+func (e *Engine) RefreshAllBalancesWithTrigger(ctx context.Context, trigger string) int {
 	list := e.pool.AllAccounts()
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 2)
+	sem := make(chan struct{}, balanceRefreshConc)
 	var mu sync.Mutex
 	okCount := 0
 
@@ -396,7 +420,7 @@ func (e *Engine) RefreshAllBalances(ctx context.Context) int {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if _, err := e.RefreshAccountBalance(ctx, id); err == nil {
+			if _, err := e.RefreshAccountBalanceWithTrigger(ctx, id, trigger); err == nil {
 				mu.Lock()
 				okCount++
 				mu.Unlock()
@@ -477,17 +501,18 @@ func (e *Engine) CheckinAccount(ctx context.Context, id, source string) CheckinR
 		rec.Status = "done"
 		rec.Points = outcome.Points
 		rec.Message = outcome.Message
+		e.pool.UpdateCheckinStateWithPoints(acc.ID, today, rec.Status, rec.Message, rec.Points)
 		if errAct := protocol.ReportLoginActive(ctx, client, baseURL, acc.Cred.AccessToken, acc.Cred.DeviceID); errAct == nil {
 			rec.ActiveReported = true
 		}
 		// 签到成功后刷新一次余额
-		_, _ = e.RefreshAccountBalance(ctx, acc.ID)
+		_, _ = e.RefreshAccountBalanceWithTrigger(ctx, acc.ID, "checkin")
 	} else {
 		rec.Status = "failed"
 		rec.Message = outcome.Message
 	}
 
-	e.pool.UpdateCheckinState(acc.ID, today, rec.Status, rec.Message)
+	e.pool.UpdateCheckinStateWithPoints(acc.ID, today, rec.Status, rec.Message, rec.Points)
 	e.appendHistory(rec)
 	if e.logger != nil {
 		e.logger.Info("Checkin", "账号 [%s] 签到结果: %s (%s)", rec.AccountLabel, rec.Status, rec.Message)
@@ -496,8 +521,6 @@ func (e *Engine) CheckinAccount(ctx context.Context, id, source string) CheckinR
 }
 
 // CheckinAll 对所有启用且未会话失效的账号批量执行每日签到。
-// source 为 auto 时跳过当日已签到成功的账号，并在多账号之间加入随机错峰延迟，
-// 避免多账号同一秒并发请求触发上游风控。
 func (e *Engine) CheckinAll(ctx context.Context, source string) []CheckinRecord {
 	e.mu.Lock()
 	if e.runningCheckin {
@@ -512,30 +535,38 @@ func (e *Engine) CheckinAll(ctx context.Context, source string) []CheckinRecord 
 		e.mu.Unlock()
 	}()
 
-	auto := source == "auto"
 	today := time.Now().Format("2006-01-02")
 	list := e.pool.AllAccounts()
-	results := make([]CheckinRecord, 0, len(list))
-	processed := 0
+	candidates := make([]accounts.Account, 0, len(list))
 	for _, acc := range list {
 		if acc.Cred.Disabled || acc.SessionDead {
 			continue
 		}
-		if auto && acc.LastCheckin == today && (acc.CheckinStatus == "done" || acc.CheckinStatus == "already") {
+		// 自动签到跳过当日已签到（done/already）的账号，避免重启或重复触发造成冗余请求
+		if source == "auto" && acc.LastCheckin == today && (acc.CheckinStatus == "done" || acc.CheckinStatus == "already") {
 			continue
 		}
-		if processed > 0 {
-			// 随机 3~10 秒错峰；ctx 被取消时尽快返回
-			delay := time.Duration(3+rand.Int64N(8)) * time.Second
-			select {
-			case <-ctx.Done():
-				return results
-			case <-time.After(delay):
+		candidates = append(candidates, acc)
+	}
+
+	results := make([]CheckinRecord, 0, len(candidates))
+	for i, acc := range candidates {
+		if i > 0 && source == "auto" && e.checkinStagger != nil {
+			if wait := e.checkinStagger(); wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return results
+				case <-timer.C:
+				}
 			}
+		}
+		if ctx.Err() != nil {
+			break
 		}
 		rec := e.CheckinAccount(ctx, acc.ID, source)
 		results = append(results, rec)
-		processed++
 	}
 	return results
 }
