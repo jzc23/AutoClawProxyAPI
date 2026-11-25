@@ -142,6 +142,7 @@ func TestPanelPasswordSetupLoginAndVKeyIsolation(t *testing.T) {
 
 func TestGatewayAuthFailoverAndPerAccountProxy(t *testing.T) {
 	var upstreamHits atomic.Int32
+	var lastUpstreamStream atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != protocol.PathChat {
 			http.NotFound(w, r)
@@ -157,6 +158,7 @@ func TestGatewayAuthFailoverAndPerAccountProxy(t *testing.T) {
 		var reqMap map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&reqMap)
 		if stream, _ := reqMap["stream"].(bool); stream {
+			lastUpstreamStream.Store(true)
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("data: {\"id\":\"cmpl-s1\",\"model\":\"glm-5.3-flash\",\"choices\":[{\"delta\":{\"content\":\"你好世界\"}}]}\n\n"))
@@ -164,6 +166,7 @@ func TestGatewayAuthFailoverAndPerAccountProxy(t *testing.T) {
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
 			return
 		}
+		lastUpstreamStream.Store(false)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"cmpl-1","object":"chat.completion","model":"glm-5.3-flash","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"网关回复正常"}}],"usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16}}`))
 	}))
@@ -185,16 +188,42 @@ func TestGatewayAuthFailoverAndPerAccountProxy(t *testing.T) {
 		return nil
 	})
 
-	// 1. Bearer 鉴权 + /v1/chat/completions 自动切号验证
+	// 1. Bearer 鉴权 + /v1/chat/completions 自动切号验证。
+	// 默认开启内部流式回退：客户端 stream 未置 true 时，上游侧收到的是 stream:true，
+	// 网关聚合 SSE 后返回完整 JSON（修复上游 stream:false 管道不投递用户内容的问题）。
 	chatReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":"测试"}]}`))
 	chatReq.Header.Set("Authorization", "Bearer "+vkey)
 	chatRec := httptest.NewRecorder()
 	handler.ServeHTTP(chatRec, chatReq)
-	if chatRec.Code != http.StatusOK || !strings.Contains(chatRec.Body.String(), "网关回复正常") {
-		t.Fatalf("故障切号后应成功响应，实际 status=%d body=%s", chatRec.Code, chatRec.Body.String())
+	if chatRec.Code != http.StatusOK || !strings.Contains(chatRec.Body.String(), "你好世界") {
+		t.Fatalf("故障切号后应成功响应（内部流式聚合），实际 status=%d body=%s", chatRec.Code, chatRec.Body.String())
+	}
+	if !lastUpstreamStream.Load() {
+		t.Fatalf("默认配置下非流式请求应向上游改发 stream:true")
+	}
+	if !strings.Contains(chatRec.Body.String(), `"finish_reason":"stop"`) || !strings.Contains(chatRec.Body.String(), `"usage":{`) {
+		t.Fatalf("聚合结果应包含 finish_reason 与 usage，实际: %s", chatRec.Body.String())
 	}
 	if upstreamHits.Load() != 2 {
 		t.Fatalf("预期切号重试共命中上游 2 次，实际: %d", upstreamHits.Load())
+	}
+
+	// 1b. 配置 disable_stream_fallback=true 时恢复直发 stream:false，走非流式 JSON 直传
+	if _, err := cfgMgr.Update(func(c *config.Config) error {
+		c.Upstream.DisableStreamFallback = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	directReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"glm-5.3-flash","stream":false,"messages":[{"role":"user","content":"直发"}]}`))
+	directReq.Header.Set("Authorization", "Bearer "+vkey)
+	directRec := httptest.NewRecorder()
+	handler.ServeHTTP(directRec, directReq)
+	if directRec.Code != http.StatusOK || !strings.Contains(directRec.Body.String(), "网关回复正常") {
+		t.Fatalf("关闭流式回退后应直发 stream:false 并透传 JSON，实际 status=%d body=%s", directRec.Code, directRec.Body.String())
+	}
+	if lastUpstreamStream.Load() {
+		t.Fatalf("disable_stream_fallback=true 时上游应收到 stream:false")
 	}
 
 	// 2. x-api-key 鉴权 + /v1/messages 流式转换验证

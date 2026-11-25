@@ -232,7 +232,13 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 			}
 			continue
 		}
-		respBytes, errCall := protocol.ChatCompletion(ctx, client, protocol.ChatRequest{
+		// 非流式默认走内部流式回退：上游 stream:false 管道不向模型投递用户内容，
+		// 改发 stream:true 并在网关聚合完整 JSON；配置 disable_stream_fallback=true 时恢复直发
+		chatCall := protocol.ChatCompletion
+		if !s.cfgMgr.Get().Upstream.DisableStreamFallback {
+			chatCall = protocol.ChatCompletionAggregated
+		}
+		respBytes, errCall := chatCall(ctx, client, protocol.ChatRequest{
 			BaseURL: baseURL,
 			Token:   acc.Cred.AccessToken,
 			Model:   target.UpstreamModel,

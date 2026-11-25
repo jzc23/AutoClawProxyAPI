@@ -26,7 +26,10 @@ import (
 // 空格并 flush，持续重置反向代理/Cloudflare 的读超时，传输不再被切断返回 504。
 // v1.1.1: 整合上游 v1.1.0（内置 mihomo 订阅代理桥、积分余额变动历史与归因、
 // 登录出口选择、面板扩展），保留本 fork 全部安全加固与非流式心跳保活（宽限期 8s）。
-const Version = "v1.1.1"
+// v1.1.2: 非流式请求默认改走内部流式回退——实测上游 stream:false 管道不向模型投递
+// 用户消息（只回复"你好，我无法给到相关内容"），网关改发 stream:true 并聚合完整 JSON；
+// 可配置 upstream.disable_stream_fallback=true 关闭。
+const Version = "v1.1.2"
 
 // PanelAuth 保存 Web 控制台登录密码的安全哈希（不存明文）。
 type PanelAuth struct {
@@ -171,6 +174,11 @@ type ProxyConfig struct {
 type UpstreamConfig struct {
 	CNBaseURL     string `json:"cn_base_url"`
 	GlobalBaseURL string `json:"global_base_url"`
+	// DisableStreamFallback 置为 true 时，非流式请求保持原样直发上游 stream:false。
+	// 默认 false：非流式请求在网关内改发 stream:true 并聚合完整 JSON 返回——
+	// 实测 AutoClaw 上游 stream:false 管道不会向模型投递用户消息（模型只回复
+	// "你好，我无法给到相关内容"），流式管道正常，故默认开启内部流式回退。
+	DisableStreamFallback bool `json:"disable_stream_fallback,omitempty"`
 }
 
 // RetryConfig 定义指数退避重试与分级冷却时长参数。
