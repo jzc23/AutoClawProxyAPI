@@ -6,12 +6,16 @@
 *.test
 *.out
 autoclaw2api
-mihomo
-mihomo.exe
+/mihomo
+/mihomo.exe
 *.part
 dist/
 bin/
 build/
+
+# 本地工具与规划文件（不入库）
+.zcode/
+.zcodeignore
 *.zip
 
 # 运行时配置与敏感凭证文件

@@ -15,6 +15,9 @@ import (
 	"autoclaw2api/internal/proxypool"
 )
 
+// ErrNoActiveAccount 表示账号池中已无任何已启用且未失效的账号，属于可控的调度侧瞬态状态。
+var ErrNoActiveAccount = errors.New("账号池中暂无有效账号")
+
 // RouteTarget 表示一条具体的上游路由目标（区域 + 剥离前缀后的裸模型名）。
 type RouteTarget struct {
 	Region        protocol.Region
@@ -245,6 +248,9 @@ func (r *Router) ResolveTargets(requested string) ([]RouteTarget, error) {
 			expanded = append(expanded, r.resolveSingleSpec(targetSpec)...)
 		}
 		if len(expanded) == 0 {
+			if !r.hasActiveAccount(protocol.RegionCN) && !r.hasActiveAccount(protocol.RegionGlobal) {
+				return nil, ErrNoActiveAccount
+			}
 			return nil, fmt.Errorf("别名 %s 指向的目标模型均不可用或已禁用", modelName)
 		}
 		if len(expanded) > 1 {
@@ -262,6 +268,9 @@ func (r *Router) ResolveTargets(requested string) ([]RouteTarget, error) {
 
 	targets := r.resolveSingleSpec(modelName)
 	if len(targets) == 0 {
+		if !r.hasActiveAccount(protocol.RegionCN) && !r.hasActiveAccount(protocol.RegionGlobal) {
+			return nil, ErrNoActiveAccount
+		}
 		return nil, fmt.Errorf("未找到可用路由目标: %s", modelName)
 	}
 	return targets, nil
@@ -291,7 +300,6 @@ func (r *Router) resolveSingleSpec(spec string) []RouteTarget {
 	inCN := r.hasModelInRegion(protocol.RegionCN, spec)
 	inGlobal := r.hasModelInRegion(protocol.RegionGlobal, spec)
 
-	stats := r.pool.Stats()
 	switch {
 	case inCN && inGlobal:
 		targets := []RouteTarget{
@@ -311,12 +319,13 @@ func (r *Router) resolveSingleSpec(spec string) []RouteTarget {
 	case inGlobal:
 		return []RouteTarget{{Region: protocol.RegionGlobal, UpstreamModel: spec}}
 	default:
-		// 未在已同步目录中命中的透传模型：优先调度存在就绪账号的区域
+		// 未在已同步目录中命中的透传模型：只要该区仍有活跃账号就下发目标。
+		// 冷却/暂时无就绪账号属于调度层状态，由网关以 503 表达，不能在这里判定为「模型不存在」。
 		var targets []RouteTarget
-		if stats.ReadyCN > 0 {
+		if r.hasActiveAccount(protocol.RegionCN) {
 			targets = append(targets, RouteTarget{Region: protocol.RegionCN, UpstreamModel: spec})
 		}
-		if stats.ReadyGlobal > 0 {
+		if r.hasActiveAccount(protocol.RegionGlobal) {
 			targets = append(targets, RouteTarget{Region: protocol.RegionGlobal, UpstreamModel: spec})
 		}
 		return targets

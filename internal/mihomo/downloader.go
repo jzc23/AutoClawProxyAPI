@@ -237,7 +237,7 @@ func downloadToFile(ctx context.Context, client *http.Client, rawURL, partPath s
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "AutoClaw2API/1.1.0")
+	req.Header.Set("User-Agent", "AutoClaw2API/1.2.0")
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

@@ -3,6 +3,7 @@ package accounts
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -127,6 +128,158 @@ func TestPoolRoundRobinCooldownAndFailover(t *testing.T) {
 	gl, ok := pool.Acquire(protocol.RegionGlobal, nil)
 	if !ok || gl.ID != "autoclawglobal-g1" {
 		t.Fatalf("国际区账号调度应保持独立可用")
+	}
+}
+
+func TestPoolModelScopedQuotaCooldown(t *testing.T) {
+	dir := t.TempDir()
+	authDir := filepath.Join(dir, "auths")
+	dataDir := filepath.Join(dir, "data")
+	mgr, err := config.Load(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Update(func(c *config.Config) error {
+		c.AuthDir = authDir
+		c.DataDir = dataDir
+		c.Retry.LongCooldownSec = 600
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"autoclawcn-q1.json": `{"region":"cn","accessToken":"tok-q1","userId":"q1"}`,
+		"autoclawcn-q2.json": `{"region":"cn","accessToken":"tok-q2","userId":"q2"}`,
+	} {
+		if err := os.WriteFile(filepath.Join(authDir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool, err := NewPool(mgr, nil)
+	if err != nil {
+		t.Fatalf("创建账号池失败: %v", err)
+	}
+
+	// 1. 模型级额度错误：只写该模型冷却，账号保持在线且无账号级冷却
+	quotaErr := protocol.ClassifyError(403, 0,
+		`{"code":810000,"message":"GLM-5.3 free quota used up. Subscribe to a membership to continue."}`, 0)
+	pool.ReportErrorForModel("autoclawcn-q1", "zaicoding_glm-5.3", quotaErr)
+
+	acc, ok := pool.GetByID("autoclawcn-q1")
+	if !ok {
+		t.Fatalf("账号不存在")
+	}
+	if acc.SessionDead {
+		t.Fatalf("模型级额度错误不应把账号标记为会话失效")
+	}
+	if !acc.CooldownUntil.IsZero() || acc.CooldownKind != "" {
+		t.Fatalf("模型级额度错误不应设置账号级冷却: %+v", acc)
+	}
+	if acc.EffectiveStatus(time.Now()) != StatusOnline {
+		t.Fatalf("模型级额度错误后账号应保持在线，实际: %s", acc.EffectiveStatus(time.Now()))
+	}
+	if remain, cooling := pool.ModelQuotaCooldown("zaicoding_glm-5.3"); !cooling || remain <= 0 {
+		t.Fatalf("应记录该模型的额度冷却: remain=%v cooling=%v", remain, cooling)
+	}
+	if _, cooling := pool.ModelQuotaCooldown("zai_auto"); cooling {
+		t.Fatalf("其它模型不应受该额度冷却影响")
+	}
+
+	// 2. 该模型调度应跳过已冷却账号
+	got, acquired := pool.AcquireStickyForModel(protocol.RegionCN, "", nil, "zaicoding_glm-5.3")
+	if !acquired || got.ID != "autoclawcn-q2" {
+		t.Fatalf("额度冷却模型应跳过 q1 只调度 q2: got=%v acquired=%v", got, acquired)
+	}
+
+	// 3. 其它模型仍可调度到 q1
+	seen := map[string]bool{}
+	for i := 0; i < 4; i++ {
+		a, ok := pool.AcquireStickyForModel(protocol.RegionCN, "", nil, "zai_auto")
+		if !ok {
+			t.Fatalf("其它模型应保持可调度")
+		}
+		seen[a.ID] = true
+	}
+	if !seen["autoclawcn-q1"] {
+		t.Fatalf("其它模型仍应能调度到已进行模型级冷却的账号")
+	}
+
+	// 4. 账号级额度错误仍按账号级长冷却处理（回归）
+	pool.ReportError("autoclawcn-q2", protocol.ClassifyError(402, 0, "余额不足", 0))
+	acc2, _ := pool.GetByID("autoclawcn-q2")
+	if acc2.CooldownUntil.IsZero() || acc2.CooldownKind != "hard_credit" {
+		t.Fatalf("账号级额度错误应设置账号级冷却: %+v", acc2)
+	}
+
+	// 5. 已停用账号上残留的模型冷却不应影响对外错误判定
+	disabled := true
+	if err := pool.UpdateMeta("autoclawcn-q1", nil, nil, &disabled); err != nil {
+		t.Fatal(err)
+	}
+	if _, cooling := pool.ModelQuotaCooldown("zaicoding_glm-5.3"); cooling {
+		t.Fatalf("已停用账号的残留模型冷却不应参与错误判定")
+	}
+}
+
+func TestRouterRoutingSurvivesCooldownAndNoActiveSentinel(t *testing.T) {
+	dir := t.TempDir()
+	authDir := filepath.Join(dir, "auths")
+	dataDir := filepath.Join(dir, "data")
+	mgr, err := config.Load(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Update(func(c *config.Config) error {
+		c.AuthDir = authDir
+		c.DataDir = dataDir
+		c.Routing.Aliases = map[string][]string{"auto-alias": {"never-synced-model"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"autoclawcn-r1.json": `{"region":"cn","accessToken":"tok-r1","userId":"r1"}`,
+		"autoclawcn-r2.json": `{"region":"cn","accessToken":"tok-r2","userId":"r2"}`,
+	} {
+		if err := os.WriteFile(filepath.Join(authDir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool, err := NewPool(mgr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyMgr, err := proxypool.NewManager(dataDir, config.ProxyConfig{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter(mgr, pool, proxyMgr, nil)
+
+	// 1. 账号级冷却不应让未同步目录的透传模型变成「模型不存在」
+	pool.ReportError("autoclawcn-r1", protocol.ClassifyError(402, 0, "余额不足", 0))
+	targets, err := router.ResolveTargets("never-synced-model")
+	if err != nil || len(targets) != 1 || targets[0].Region != protocol.RegionCN {
+		t.Fatalf("账号冷却时仍应下发透传路由目标: targets=%+v err=%v", targets, err)
+	}
+	aliasTargets, err := router.ResolveTargets("auto-alias")
+	if err != nil || len(aliasTargets) != 1 || aliasTargets[0].Region != protocol.RegionCN {
+		t.Fatalf("账号冷却时别名仍应解析到透传目标: targets=%+v err=%v", aliasTargets, err)
+	}
+
+	// 2. 双区均无活跃账号时应返回明确哨兵错误，便于网关映射为 503
+	pool.ReportError("autoclawcn-r1", protocol.ClassifyError(200, 410000, "not logged in", 0))
+	pool.ReportError("autoclawcn-r2", protocol.ClassifyError(200, 410000, "not logged in", 0))
+	if _, err := router.ResolveTargets("never-synced-model"); !errors.Is(err, ErrNoActiveAccount) {
+		t.Fatalf("无活跃账号时应返回 ErrNoActiveAccount，实际: %v", err)
+	}
+	if _, err := router.ResolveTargets("auto-alias"); !errors.Is(err, ErrNoActiveAccount) {
+		t.Fatalf("无活跃账号时别名也应返回 ErrNoActiveAccount，实际: %v", err)
 	}
 }
 

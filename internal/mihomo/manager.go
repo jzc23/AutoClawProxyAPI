@@ -33,6 +33,7 @@ type bridgeDiskState struct {
 	Enabled              bool      `json:"enabled"`
 	Subscriptions        []string  `json:"subscriptions"`
 	BasePort             int       `json:"base_port"`
+	MaxNodes             int       `json:"max_nodes"`
 	MixedPort            int       `json:"mixed_port"`
 	Controller           string    `json:"controller"`
 	Secret               string    `json:"secret"`
@@ -40,6 +41,8 @@ type bridgeDiskState struct {
 	AutoProbeIntervalMin int       `json:"auto_probe_interval_min"`
 	LastProbeAt          string    `json:"last_probe_at,omitempty"`
 	Nodes                []SubNode `json:"nodes"`
+	// ExcludedNodes 保存被用户删除、需要长期排除的节点名称，重新同步订阅时不再映射。
+	ExcludedNodes []string `json:"excluded_nodes"`
 }
 
 // Snapshot 描述面向 Web 控制台展示的 mihomo 登录节点桥实时快照。
@@ -52,6 +55,7 @@ type Snapshot struct {
 	Enabled              bool          `json:"enabled"`
 	Subscriptions        []string      `json:"subscriptions"`
 	BasePort             int           `json:"base_port"`
+	MaxNodes             int           `json:"max_nodes"`
 	AutoProbeEnabled     bool          `json:"auto_probe_enabled"`
 	AutoProbeIntervalMin int           `json:"auto_probe_interval_min"`
 	LastProbeAt          string        `json:"last_probe_at,omitempty"`
@@ -61,6 +65,8 @@ type Snapshot struct {
 	TotalCount           int           `json:"total_count"`
 	NextLoginNode        string        `json:"next_login_node,omitempty"`
 	Nodes                []SubNode     `json:"nodes"`
+	ExcludedCount        int           `json:"excluded_count"`
+	ExcludedNodes        []string      `json:"excluded_nodes"`
 	Download             DownloadState `json:"download"`
 	LastError            string        `json:"last_error,omitempty"`
 }
@@ -116,7 +122,7 @@ func NewManager(baseDir, dataDir string, logger *logging.Logger) (*Manager, erro
 		statePath:    filepath.Join(dataDir, "mihomo_bridge.json"),
 		logger:       logger,
 		wakeCh:       make(chan struct{}, 1),
-		httpCtl:      &http.Client{Timeout: 8 * time.Second},
+		httpCtl:      &http.Client{Timeout: 30 * time.Second},
 		dlClient:     &http.Client{Timeout: 8 * time.Minute},
 		mirrorPrefix: DefaultMirrorPrefix,
 		githubBase:   DefaultGitHubReleaseBase,
@@ -128,12 +134,14 @@ func NewManager(baseDir, dataDir string, logger *logging.Logger) (*Manager, erro
 			Enabled:              false,
 			Subscriptions:        []string{"", "", ""},
 			BasePort:             defaultBasePort,
+			MaxNodes:             DefaultMaxNodes,
 			MixedPort:            defaultMixedPort,
 			Controller:           defaultController,
 			Secret:               randomHex(8),
 			AutoProbeEnabled:     true,
 			AutoProbeIntervalMin: 10,
 			Nodes:                []SubNode{},
+			ExcludedNodes:        []string{},
 		},
 	}
 	m.loadState()
@@ -180,6 +188,24 @@ func normalizeProbeMin(v int) int {
 	return v
 }
 
+// scaledStartWait 按节点规模放宽 mihomo 启动等待时间（每个监听端口都会增加配置解析与监听初始化耗时）。
+func scaledStartWait(nodeCount int) time.Duration {
+	d := 10*time.Second + time.Duration(nodeCount)*20*time.Millisecond
+	if d > 2*time.Minute {
+		d = 2 * time.Minute
+	}
+	return d
+}
+
+// scaledProbeTimeout 按节点规模放宽整体测速超时，避免大订阅只完成一小部分节点测速。
+func scaledProbeTimeout(nodeCount int) time.Duration {
+	d := 60*time.Second + time.Duration(nodeCount)*300*time.Millisecond
+	if d > 20*time.Minute {
+		d = 20 * time.Minute
+	}
+	return d
+}
+
 func (m *Manager) loadState() {
 	raw, err := os.ReadFile(m.statePath)
 	if err != nil {
@@ -193,6 +219,12 @@ func (m *Manager) loadState() {
 	if st.BasePort < 1024 || st.BasePort > 60000 {
 		st.BasePort = defaultBasePort
 	}
+	if st.MaxNodes <= 0 {
+		st.MaxNodes = DefaultMaxNodes
+	}
+	if st.MaxNodes > MaxNodesLimit {
+		st.MaxNodes = MaxNodesLimit
+	}
 	if st.MixedPort < 1024 || st.MixedPort > 65535 {
 		st.MixedPort = defaultMixedPort
 	}
@@ -205,6 +237,9 @@ func (m *Manager) loadState() {
 	st.AutoProbeIntervalMin = normalizeProbeMin(st.AutoProbeIntervalMin)
 	if st.Nodes == nil {
 		st.Nodes = []SubNode{}
+	}
+	if st.ExcludedNodes == nil {
+		st.ExcludedNodes = []string{}
 	}
 	st.Nodes = SortNodesByDelay(st.Nodes)
 	m.state = st
@@ -241,8 +276,15 @@ func (m *Manager) Start(ctx context.Context) {
 	m.mu.RUnlock()
 
 	if shouldBoot {
+		m.mu.RLock()
+		nodeCnt := len(m.state.Nodes)
+		m.mu.RUnlock()
+		bootWait := 25 * time.Second
+		if nodeCnt > 0 {
+			bootWait = scaledStartWait(nodeCnt) + 5*time.Second
+		}
 		go func() {
-			bootCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+			bootCtx, cancel := context.WithTimeout(ctx, bootWait)
 			defer cancel()
 			if err := m.ensureProcessRunning(bootCtx); err != nil {
 				if m.logger != nil {
@@ -251,13 +293,10 @@ func (m *Manager) Start(ctx context.Context) {
 				return
 			}
 			// 若已有节点列表则延迟测一次速，否则拉取一次订阅节点
-			m.mu.RLock()
-			nodeCnt := len(m.state.Nodes)
-			m.mu.RUnlock()
 			if nodeCnt == 0 {
 				_, _ = m.RefreshSubscriptions(bootCtx)
 			} else {
-				probeCtx, pCancel := context.WithTimeout(ctx, 45*time.Second)
+				probeCtx, pCancel := context.WithTimeout(ctx, scaledProbeTimeout(nodeCnt))
 				defer pCancel()
 				_, _ = m.ProbeAllNodes(probeCtx)
 			}
@@ -288,9 +327,10 @@ func (m *Manager) Start(ctx context.Context) {
 			case <-timer.C:
 				m.mu.RLock()
 				en := m.state.Enabled && m.state.AutoProbeEnabled && len(m.state.Nodes) > 0
+				nodeCnt := len(m.state.Nodes)
 				m.mu.RUnlock()
 				if en && m.IsRunning() {
-					probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+					probeCtx, cancel := context.WithTimeout(ctx, scaledProbeTimeout(nodeCnt))
 					_, _ = m.ProbeAllNodes(probeCtx)
 					cancel()
 				}
@@ -360,6 +400,7 @@ func (m *Manager) Snapshot() Snapshot {
 		Enabled:              m.state.Enabled,
 		Subscriptions:        append([]string(nil), m.state.Subscriptions...),
 		BasePort:             m.state.BasePort,
+		MaxNodes:             m.state.MaxNodes,
 		AutoProbeEnabled:     m.state.AutoProbeEnabled,
 		AutoProbeIntervalMin: m.state.AutoProbeIntervalMin,
 		LastProbeAt:          m.state.LastProbeAt,
@@ -369,6 +410,8 @@ func (m *Manager) Snapshot() Snapshot {
 		TotalCount:           len(nodes),
 		NextLoginNode:        nextNodeName,
 		Nodes:                nodes,
+		ExcludedCount:        len(m.state.ExcludedNodes),
+		ExcludedNodes:        append([]string(nil), m.state.ExcludedNodes...),
 		Download:             m.download,
 		LastError:            m.lastError,
 	}
@@ -535,8 +578,8 @@ func (m *Manager) StartDownload() (DownloadState, error) {
 	return snap, nil
 }
 
-// UpdateConfig 更新订阅链接、开关或后台定时测速参数，并按需拉起或停止 mihomo 进程。
-func (m *Manager) UpdateConfig(ctx context.Context, enabled *bool, subs []string, autoProbe *bool, probeMin *int) (Snapshot, error) {
+// UpdateConfig 更新订阅链接、开关、最大映射节点数或后台定时测速参数，并按需拉起或停止 mihomo 进程。
+func (m *Manager) UpdateConfig(ctx context.Context, enabled *bool, subs []string, autoProbe *bool, probeMin *int, maxNodes *int) (Snapshot, error) {
 	needRefresh := false
 	needStop := false
 
@@ -570,6 +613,16 @@ func (m *Manager) UpdateConfig(ctx context.Context, enabled *bool, subs []string
 			return Snapshot{}, errors.New("后台测速间隔必须为 1 ～ 1440 分钟之间的整数")
 		}
 		m.state.AutoProbeIntervalMin = *probeMin
+	}
+	if maxNodes != nil {
+		if *maxNodes < 1 || *maxNodes > MaxNodesLimit {
+			m.mu.Unlock()
+			return Snapshot{}, fmt.Errorf("最大映射节点数必须为 1 ～ %d 之间的整数", MaxNodesLimit)
+		}
+		if m.state.MaxNodes != *maxNodes {
+			m.state.MaxNodes = *maxNodes
+			needRefresh = true
+		}
 	}
 	if err := m.saveStateLocked(); err != nil {
 		m.mu.Unlock()
@@ -612,14 +665,14 @@ func (m *Manager) RefreshSubscriptions(ctx context.Context) (Snapshot, error) {
 		return m.Snapshot(), err
 	}
 
-	// 2. 等待 proxy-providers 拉取就绪（最多 15 秒）
-	rawNodes, err := m.waitForProviderNodes(ctx, 15*time.Second)
+	// 2. 等待 proxy-providers 拉取就绪（最多 90 秒：大订阅或中转站慢响应都可能超过 30 秒）
+	rawNodes, err := m.waitForProviderNodes(ctx, 90*time.Second)
 	if err != nil {
 		m.setLastError(err.Error())
 		return m.Snapshot(), err
 	}
 
-	// 3. 过滤假节点与非落地策略组，并分配稳定独立端口（20001 起）
+	// 3. 过滤假节点与非落地策略组，剔除用户手动删除的节点，并分配稳定独立端口（20001 起）
 	realNames := FilterRealNodes(rawNodes)
 	filteredFake := len(rawNodes) - len(realNames)
 	if filteredFake < 0 {
@@ -627,7 +680,12 @@ func (m *Manager) RefreshSubscriptions(ctx context.Context) (Snapshot, error) {
 	}
 
 	m.mu.Lock()
-	assigned := AssignStableNodePorts(realNames, m.state.Nodes, m.state.BasePort, 120)
+	// 排除记录只保留当前订阅里仍存在的名字，避免换订阅后旧机场节点名长期残留、误伤同名新节点。
+	beforePrune := len(m.state.ExcludedNodes)
+	m.state.ExcludedNodes = PruneExcludedNames(m.state.ExcludedNodes, realNames)
+	prunedExcluded := beforePrune - len(m.state.ExcludedNodes)
+	realNames = FilterExcludedNames(realNames, m.state.ExcludedNodes)
+	assigned := AssignStableNodePorts(realNames, m.state.Nodes, m.state.BasePort, m.state.MaxNodes)
 	m.state.Nodes = SortNodesByDelay(assigned)
 	m.state.Enabled = true
 	m.filteredFake = filteredFake
@@ -645,14 +703,14 @@ func (m *Manager) RefreshSubscriptions(ctx context.Context) (Snapshot, error) {
 	}
 
 	if m.logger != nil {
-		m.logger.Info("Mihomo", "订阅同步成功：共映射 %d 个真实节点（已过滤 %d 个假节点），独立回环端口 %d 起",
-			len(assigned), filteredFake, m.state.BasePort)
+		m.logger.Info("Mihomo", "订阅同步成功：共映射 %d 个真实节点（已过滤 %d 个假节点、清理 %d 条历史排除记录），独立回环端口 %d 起",
+			len(assigned), filteredFake, prunedExcluded, m.state.BasePort)
 	}
 
 	// 5. 异步触发一轮并发测速
 	if len(assigned) > 0 {
 		go func() {
-			pCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			pCtx, cancel := context.WithTimeout(context.Background(), scaledProbeTimeout(len(assigned)))
 			defer cancel()
 			_, _ = m.ProbeAllNodes(pCtx)
 		}()
@@ -693,6 +751,10 @@ func (m *Manager) ProbeAllNodes(ctx context.Context) (Snapshot, error) {
 
 	// 优先尝试 /group/PROXY/delay 组测速；未命中节点走 8 并发单节点补测
 	delayMap := m.probeGroupDelay(ctx, ctl, secret)
+	if ctx.Err() != nil {
+		// 调用方已取消/超时，放弃本轮结果，避免把未测节点误标为超时
+		return m.Snapshot(), ctx.Err()
+	}
 
 	sem := make(chan struct{}, probeConcurrency)
 	var wg sync.WaitGroup
@@ -707,22 +769,40 @@ func (m *Manager) ProbeAllNodes(ctx context.Context) (Snapshot, error) {
 			continue
 		}
 		wg.Add(1)
-		go func(idx int, nodeName string) {
+		go func(idx int, groupName string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			d := m.probeSingleDelay(ctx, ctl, secret, nodeName)
+			d := m.probeSingleDelay(ctx, ctl, secret, groupName)
+			if ctx.Err() != nil {
+				return
+			}
 			mapMu.Lock()
 			nodes[idx].DelayMS = d
 			nodes[idx].CheckedAt = nowStr
 			mapMu.Unlock()
-		}(i, name)
+		}(i, fmt.Sprintf("PUB-%d", nodes[i].Port))
 	}
 	wg.Wait()
 
+	if ctx.Err() != nil {
+		return m.Snapshot(), ctx.Err()
+	}
+
 	sorted := SortNodesByDelay(nodes)
 	m.mu.Lock()
-	m.state.Nodes = sorted
+	// 测速期间可能有节点被删除：写回前剔除已排除节点，避免删除操作被测速结果覆盖。
+	excluded := make(map[string]struct{}, len(m.state.ExcludedNodes))
+	for _, n := range m.state.ExcludedNodes {
+		excluded[n] = struct{}{}
+	}
+	kept := make([]SubNode, 0, len(sorted))
+	for _, n := range sorted {
+		if _, gone := excluded[n.Name]; !gone {
+			kept = append(kept, n)
+		}
+	}
+	m.state.Nodes = kept
 	m.state.LastProbeAt = nowStr
 	_ = m.saveStateLocked()
 	m.mu.Unlock()
@@ -737,6 +817,155 @@ func (m *Manager) ProbeAllNodes(ctx context.Context) (Snapshot, error) {
 		m.logger.Info("Mihomo", "机场节点测速完成：%d / %d 可用，已按延迟升序排列", okCnt, len(sorted))
 	}
 	return m.Snapshot(), nil
+}
+
+// DeleteNodes 删除选中的机场节点：从当前映射列表移除并记入长期排除名单，
+// 之后重新同步订阅也不会再加回来；若内核可用则重建配置使被删节点端口立即释放。
+func (m *Manager) DeleteNodes(ctx context.Context, names []string) (Snapshot, error) {
+	targets := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, raw := range names {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		targets = append(targets, name)
+	}
+	if len(targets) == 0 {
+		return m.Snapshot(), errors.New("请先勾选需要删除的机场节点")
+	}
+
+	m.mu.Lock()
+	if len(m.state.Nodes) == 0 {
+		m.mu.Unlock()
+		return m.Snapshot(), errors.New("当前没有可删除的机场节点")
+	}
+	remove := make(map[string]struct{}, len(targets))
+	for _, n := range targets {
+		remove[n] = struct{}{}
+	}
+	kept := make([]SubNode, 0, len(m.state.Nodes))
+	removedNames := make([]string, 0, len(targets))
+	for _, n := range m.state.Nodes {
+		if _, drop := remove[n.Name]; drop {
+			removedNames = append(removedNames, n.Name)
+			continue
+		}
+		kept = append(kept, n)
+	}
+	if len(removedNames) == 0 {
+		m.mu.Unlock()
+		return m.Snapshot(), errors.New("未找到要删除的机场节点，节点列表可能已变化，请刷新后重试")
+	}
+	// 只把真实存在的节点记入排除名单，避免误提交的不存在名称长期污染状态。
+	m.state.ExcludedNodes = dedupeNames(append(m.state.ExcludedNodes, removedNames...))
+	m.state.Nodes = kept
+	m.loginRR = 0
+	remaining := len(kept)
+	excludedTotal := len(m.state.ExcludedNodes)
+	enabled := m.state.Enabled
+	if err := m.saveStateLocked(); err != nil {
+		m.mu.Unlock()
+		return m.Snapshot(), err
+	}
+	m.mu.Unlock()
+
+	// 重建配置：端口与 PUB 组都要随之收缩，被删节点的回环端口立刻释放。
+	if _, found := DetectBinary(m.baseDir); found && enabled {
+		if remaining == 0 {
+			m.Stop()
+		} else if err := m.restartProcess(ctx); err != nil {
+			m.setLastError(fmt.Sprintf("节点已删除，但 mihomo 重启失败：%v", err))
+		} else {
+			m.setLastError("")
+		}
+	}
+
+	if m.logger != nil {
+		m.logger.Info("Mihomo", "已删除 %d 个机场节点，剩余 %d 个，累计排除 %d 个", len(removedNames), remaining, excludedTotal)
+	}
+	return m.Snapshot(), nil
+}
+
+// RestoreExcludedNodes 清空长期排除名单；订阅桥已启用且内核可用时立即重新同步订阅把节点加回。
+// 返回的 resynced 表示本次是否真的重新拉取订阅（false 时节点要等下次同步才会回来）。
+func (m *Manager) RestoreExcludedNodes(ctx context.Context) (snap Snapshot, resynced bool, err error) {
+	m.mu.Lock()
+	restored := len(m.state.ExcludedNodes)
+	m.state.ExcludedNodes = []string{}
+	enabled := m.state.Enabled
+	subs := append([]string(nil), m.state.Subscriptions...)
+	if err := m.saveStateLocked(); err != nil {
+		m.mu.Unlock()
+		return m.Snapshot(), false, err
+	}
+	m.mu.Unlock()
+
+	if restored == 0 {
+		return m.Snapshot(), false, errors.New("当前没有被删除的机场节点")
+	}
+
+	if enabled && hasValidSub(subs) {
+		if _, found := DetectBinary(m.baseDir); found {
+			snap, err := m.RefreshSubscriptions(ctx)
+			if err != nil {
+				return snap, false, fmt.Errorf("已清空删除记录，但重新同步订阅失败: %w", err)
+			}
+			resynced = true
+		}
+	}
+	if m.logger != nil {
+		m.logger.Info("Mihomo", "已恢复 %d 个删除的机场节点（重新同步=%v）", restored, resynced)
+	}
+	return m.Snapshot(), resynced, nil
+}
+
+func dedupeNames(names []string) []string {
+	out := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, raw := range names {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// NodesByName 按名称批量取回当前映射的机场节点（用于把登录节点桥的节点转出到代理池）。
+// 返回顺序与入参一致，未命中的名称被跳过。
+func (m *Manager) NodesByName(names []string) []SubNode {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	byName := make(map[string]SubNode, len(m.state.Nodes))
+	for _, n := range m.state.Nodes {
+		byName[n.Name] = n
+	}
+	out := make([]SubNode, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, raw := range names {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		if n, ok := byName[name]; ok {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // ResolveNodeProxyURL 实现 proxypool.MihomoResolver 接口：按节点名称解析出本地回环 mixed 代理地址。
@@ -850,8 +1079,12 @@ func (m *Manager) restartProcess(ctx context.Context) error {
 	m.cmdDone = done
 	m.procMu.Unlock()
 
-	// 等待控制端口就绪（最多 10 秒）
-	deadline := time.Now().Add(10 * time.Second)
+	m.mu.RLock()
+	nodeCount := len(m.state.Nodes)
+	m.mu.RUnlock()
+
+	// 等待控制端口就绪（节点越多，配置解析与监听初始化越慢）
+	deadline := time.Now().Add(scaledStartWait(nodeCount))
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -952,8 +1185,9 @@ func (m *Manager) probeGroupDelay(ctx context.Context, ctl, secret string) map[s
 	return out
 }
 
-func (m *Manager) probeSingleDelay(ctx context.Context, ctl, secret, nodeName string) int {
-	p := "/proxies/" + url.PathEscape(nodeName) + "/delay?timeout=5000&url=" + url.QueryEscape("https://www.gstatic.com/generate_204")
+// probeSingleDelay 经节点专属的 PUB-<端口> 组测速；provider 内节点不会出现在 /proxies/<节点名> 下，直接按节点名查询只会 404。
+func (m *Manager) probeSingleDelay(ctx context.Context, ctl, secret, groupName string) int {
+	p := "/proxies/" + url.PathEscape(groupName) + "/delay?timeout=5000&url=" + url.QueryEscape("https://www.gstatic.com/generate_204")
 	status, raw, err := m.controllerRequest(ctx, http.MethodGet, p, nil, ctl, secret)
 	if err != nil || status != http.StatusOK {
 		return -1

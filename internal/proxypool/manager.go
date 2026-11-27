@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -461,6 +462,79 @@ func (m *Manager) UpdateNode(id string, name *string, rawURL *string, enabled *b
 		}
 	}
 	return nil, ErrNodeNotFound
+}
+
+// localLoopbackPort 返回代理地址指向本机回环（127.0.0.1 / localhost / ::1）时的端口号，非回环地址返回 0。
+func localLoopbackPort(rawURL string) int {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return 0
+	}
+	host := strings.ToLower(u.Hostname())
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return 0
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return 0
+	}
+	return port
+}
+
+// RemoveNodesByLocalPorts 联动清理指向本机回环端口的代理池节点（用于 mihomo 机场节点被删除后，
+// 其回环端口已失效的场景）。指向被删节点的固定出口绑定会一并解绑：账号绑定回落为继承区域默认出口，
+// 区域 fixed 绑定回落为直连，避免留下悬空引用。
+func (m *Manager) RemoveNodesByLocalPorts(ports []int) (removed, unbound int, err error) {
+	want := make(map[int]struct{}, len(ports))
+	for _, p := range ports {
+		if p > 0 {
+			want[p] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return 0, 0, nil
+	}
+
+	m.mu.Lock()
+	dropIDs := make(map[string]struct{})
+	kept := make([]Node, 0, len(m.state.Nodes))
+	for _, n := range m.state.Nodes {
+		if port := localLoopbackPort(n.URL); port != 0 {
+			if _, hit := want[port]; hit {
+				dropIDs[n.ID] = struct{}{}
+				continue
+			}
+		}
+		kept = append(kept, n)
+	}
+	if len(dropIDs) == 0 {
+		m.mu.Unlock()
+		return 0, 0, nil
+	}
+	for id := range dropIDs {
+		delete(m.health, id)
+		m.evictTransportLocked(id)
+	}
+	for accID, b := range m.state.Bindings {
+		if b.Mode == ModeFixed {
+			if _, gone := dropIDs[b.ProxyID]; gone {
+				delete(m.state.Bindings, accID)
+				unbound++
+			}
+		}
+	}
+	for reg, b := range m.state.Regions {
+		if b.Mode == ModeFixed {
+			if _, gone := dropIDs[b.ProxyID]; gone {
+				m.state.Regions[reg] = Binding{Mode: ModeDirect}
+				unbound++
+			}
+		}
+	}
+	m.state.Nodes = kept
+	err = m.saveLocked()
+	m.mu.Unlock()
+	return len(dropIDs), unbound, err
 }
 
 // DeleteNode 删除指定节点（带防误删保护：存在账号或区域固定绑定时拒绝删除）。

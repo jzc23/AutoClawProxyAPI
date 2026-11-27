@@ -28,6 +28,9 @@ type UpstreamError struct {
 	Kind       ErrorKind
 	Message    string
 	RetryAfter time.Duration
+	// ModelScoped 标记该额度错误仅作用于单个模型（模型免费额度耗尽），
+	// 冷却应下放到（账号, 模型）维度，避免影响同账号下的其它模型。
+	ModelScoped bool
 }
 
 func (e *UpstreamError) Error() string {
@@ -55,11 +58,17 @@ func IsDeadBizCode(code int64) bool {
 	return code == BizCodeNotLoggedIn || code == BizCodeAuthExpired
 }
 
+// IsQuotaBizCode 判断业务码是否为模型免费额度耗尽码。
+func IsQuotaBizCode(code int64) bool {
+	return code == BizCodeModelQuotaExhausted
+}
+
 // errorPhraseRule 定义按响应文本关键词命中后的分级规则。
 type errorPhraseRule struct {
-	kind       ErrorKind
-	httpStatus int
-	phrases    []string
+	kind        ErrorKind
+	httpStatus  int
+	modelScoped bool
+	phrases     []string
 }
 
 var errorClassifierTable = []errorPhraseRule{
@@ -71,6 +80,17 @@ var errorClassifierTable = []errorPhraseRule{
 		phrases: []string{
 			"rate limit", "too many requests", "throttl", "qps exceed",
 			"请求过于频繁", "限流", "触发流控", "请求太快",
+		},
+	},
+	{
+		// 模型级免费额度耗尽：仅对该模型冷却，同账号其它模型不受影响。
+		kind:        ErrorKindHardCredit,
+		httpStatus:  http.StatusPaymentRequired,
+		modelScoped: true,
+		phrases: []string{
+			"free quota", "quota used up", "quota has been used up",
+			"subscribe to a membership", "upgrade to a membership",
+			"免费额度", "额度已用完", "额度已用尽", "订阅会员",
 		},
 	},
 	{
@@ -117,6 +137,13 @@ func ClassifyError(httpStatus int, bizCode int64, body string, retryAfter time.D
 		msg = http.StatusText(httpStatus)
 	}
 
+	// 非 2xx 响应在调用侧未携带业务码，这里从 JSON 信封补提，避免 810000 等业务错误被状态码兜底误判。
+	if bizCode == 0 {
+		if code, _, ok := DetectEnvelopeError([]byte(body)); ok {
+			bizCode = code
+		}
+	}
+
 	if IsDeadBizCode(bizCode) {
 		return &UpstreamError{
 			HTTPStatus: http.StatusUnauthorized,
@@ -138,16 +165,29 @@ func ClassifyError(httpStatus int, bizCode int64, body string, retryAfter time.D
 		}
 	}
 
+	// 模型免费额度耗尽（810000 等）：模型级 hard_credit，冷却下放到（账号, 模型）维度
+	if IsQuotaBizCode(bizCode) {
+		return &UpstreamError{
+			HTTPStatus:  http.StatusPaymentRequired,
+			BizCode:     bizCode,
+			Kind:        ErrorKindHardCredit,
+			Message:     msg,
+			RetryAfter:  retryAfter,
+			ModelScoped: true,
+		}
+	}
+
 	lower := strings.ToLower(body)
 	for _, rule := range errorClassifierTable {
 		for _, phrase := range rule.phrases {
 			if strings.Contains(lower, phrase) {
 				return &UpstreamError{
-					HTTPStatus: rule.httpStatus,
-					BizCode:    bizCode,
-					Kind:       rule.kind,
-					Message:    msg,
-					RetryAfter: retryAfter,
+					HTTPStatus:  rule.httpStatus,
+					BizCode:     bizCode,
+					Kind:        rule.kind,
+					Message:     msg,
+					RetryAfter:  retryAfter,
+					ModelScoped: rule.modelScoped,
 				}
 			}
 		}

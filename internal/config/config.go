@@ -29,7 +29,10 @@ import (
 // v1.1.2: 非流式请求默认改走内部流式回退——实测上游 stream:false 管道不向模型投递
 // 用户消息（只回复"你好，我无法给到相关内容"），网关改发 stream:true 并聚合完整 JSON；
 // 可配置 upstream.disable_stream_fallback=true 关闭。
-const Version = "v1.1.2"
+// v1.2.1: 整合上游 v1.2.0——模型级额度冷却（免费额度耗尽只冷却对应模型，不冻结账号池）、
+// 路由 ErrNoActiveAccount 哨兵（无活跃账号按 503 而非模型不存在）、mihomo 订阅导入增强
+// （1000+ 节点/非 Clash UA/节点删除恢复与转入代理池）；保留 fork 全部加固与流式回退。
+const Version = "v1.2.1"
 
 // PanelAuth 保存 Web 控制台登录密码的安全哈希（不存明文）。
 type PanelAuth struct {

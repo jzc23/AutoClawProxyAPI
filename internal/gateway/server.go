@@ -153,6 +153,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/admin/mihomo/config", s.withPanelAuth(s.handleAdminMihomoConfigUpdate))
 	mux.HandleFunc("POST /api/admin/mihomo/refresh", s.withPanelAuth(s.handleAdminMihomoRefresh))
 	mux.HandleFunc("POST /api/admin/mihomo/probe", s.withPanelAuth(s.handleAdminMihomoProbe))
+	mux.HandleFunc("POST /api/admin/mihomo/nodes/delete", s.withPanelAuth(s.handleAdminMihomoDeleteNodes))
+	mux.HandleFunc("POST /api/admin/mihomo/nodes/restore", s.withPanelAuth(s.handleAdminMihomoRestoreNodes))
+	mux.HandleFunc("POST /api/admin/mihomo/nodes/to-pool", s.withPanelAuth(s.handleAdminMihomoNodesToPool))
 
 	// 签到与任务
 	mux.HandleFunc("POST /api/admin/checkin/run", s.withPanelAuth(s.handleAdminCheckinRun))

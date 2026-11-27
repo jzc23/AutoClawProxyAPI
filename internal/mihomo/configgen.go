@@ -1,10 +1,19 @@
 package mihomo
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"sort"
 	"strings"
+)
+
+const (
+	// DefaultMaxNodes 是订阅桥默认映射的最大真实节点数（本地回环端口从 BasePort 顺延分配）。
+	DefaultMaxNodes = 2000
+	// MaxNodesLimit 是允许配置的节点数上限，防止监听端口与进程资源被耗尽。
+	MaxNodesLimit = 5000
 )
 
 // SubNode 表示由单 mihomo 进程映射出的一个真实机场订阅节点及其独立本地回环端口。
@@ -111,7 +120,10 @@ func AssignStableNodePorts(validNames []string, prevNodes []SubNode, basePort, m
 		basePort = 20001
 	}
 	if maxNodes <= 0 {
-		maxNodes = 120
+		maxNodes = DefaultMaxNodes
+	}
+	if maxNodes > MaxNodesLimit {
+		maxNodes = MaxNodesLimit
 	}
 	real := FilterRealNodes(validNames)
 	if len(real) > maxNodes {
@@ -193,6 +205,56 @@ func SortNodesByDelay(nodes []SubNode) []SubNode {
 	return cp
 }
 
+// SubscriptionUserAgent 是拉取订阅时声明的客户端标识。
+// 刻意不使用 Clash 系 UA：很多机场/中转站会用 Clash UA 判定是否走「订阅转换后端」生成 YAML，
+// 该后端不稳定时整条订阅直接 400/502/504（表现为拉取失败）。mihomo 的 provider 自己能解析
+// base64 链接列表、明文 URI 列表与 Clash YAML，用普通客户端 UA 拿到的原始订阅更稳定。
+const SubscriptionUserAgent = "v2rayN/6.31"
+
+// subCacheKey 让订阅缓存文件随链接变化，避免更换订阅后 mihomo 继续读取旧 provider 缓存。
+func subCacheKey(url string) string {
+	sum := sha1.Sum([]byte(url))
+	return hex.EncodeToString(sum[:])[:10]
+}
+
+// FilterExcludedNames 剔除用户手动删除（长期排除）的节点名称，保留其余真实节点。
+func FilterExcludedNames(names []string, excluded []string) []string {
+	if len(excluded) == 0 {
+		return names
+	}
+	skip := make(map[string]struct{}, len(excluded))
+	for _, n := range excluded {
+		skip[strings.TrimSpace(n)] = struct{}{}
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if _, gone := skip[strings.TrimSpace(n)]; gone {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// PruneExcludedNames 只保留当前订阅里仍然存在的排除记录：换订阅后自动丢弃旧机场的节点名，
+// 避免历史排除项长期残留、误伤同名的新节点。
+func PruneExcludedNames(excluded []string, present []string) []string {
+	if len(excluded) == 0 {
+		return excluded
+	}
+	presentSet := make(map[string]struct{}, len(present))
+	for _, n := range present {
+		presentSet[strings.TrimSpace(n)] = struct{}{}
+	}
+	out := make([]string, 0, len(excluded))
+	for _, n := range excluded {
+		if _, ok := presentSet[strings.TrimSpace(n)]; ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // EscapeRegex 转义正则表达式元字符（如 | . * + ? ^ $ ( ) [ ] { } \），用于精确匹配订阅节点名。
 func EscapeRegex(s string) string {
 	return regexp.QuoteMeta(s)
@@ -208,10 +270,10 @@ func YAMLQuote(s string) string {
 }
 
 // BuildConfigYAML 生成防 502 的单 mihomo 进程配置：
-// 1. 在 proxy-providers 段配置全部机场订阅链接（sub1..subN）；
-// 2. 在 proxy-groups 段先为每个真实节点创建 PUB-<端口> 精确过滤组（use + filter: "^<正则转义节点名>$"）；
-// 3. 在 listeners 段为每个节点创建仅监听 127.0.0.1 的 mixed 独立端口，并将 proxy 指向对应 PUB-<端口> 组名
-//    （严禁直接填订阅节点名，避免 mihomo 启动阶段报 proxy not found 引发 502）。
+//  1. 在 proxy-providers 段配置全部机场订阅链接（sub1..subN）；
+//  2. 在 proxy-groups 段先为每个真实节点创建 PUB-<端口> 精确过滤组（use + filter: "^<正则转义节点名>$"）；
+//  3. 在 listeners 段为每个节点创建仅监听 127.0.0.1 的 mixed 独立端口，并将 proxy 指向对应 PUB-<端口> 组名
+//     （严禁直接填订阅节点名，避免 mihomo 启动阶段报 proxy not found 引发 502）。
 func BuildConfigYAML(opts ConfigOptions) string {
 	mixedPort := opts.MixedPort
 	if mixedPort < 1024 || mixedPort > 65535 {
@@ -248,8 +310,10 @@ func BuildConfigYAML(opts ConfigOptions) string {
 			b.WriteString(fmt.Sprintf("  sub%d:\n", i+1))
 			b.WriteString("    type: http\n")
 			b.WriteString(fmt.Sprintf("    url: %s\n", YAMLQuote(sub)))
-			b.WriteString(fmt.Sprintf("    path: \"./providers/sub%d.yaml\"\n", i+1))
+			b.WriteString(fmt.Sprintf("    path: \"./providers/sub%d-%s.yaml\"\n", i+1, subCacheKey(sub)))
 			b.WriteString("    interval: 86400\n")
+			b.WriteString("    header:\n")
+			b.WriteString(fmt.Sprintf("      User-Agent: [%s]\n", YAMLQuote(SubscriptionUserAgent)))
 			b.WriteString("    health-check:\n")
 			b.WriteString("      enable: true\n")
 			b.WriteString("      url: \"https://www.gstatic.com/generate_204\"\n")

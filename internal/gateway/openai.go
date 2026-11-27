@@ -191,13 +191,9 @@ func (s *Server) streamOpenAIPassthrough(w http.ResponseWriter, body io.Reader, 
 
 // executeChatWithFailover 执行带短时会话粘性、指数退避与自动切号故障转移的非流式对话请求。
 func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel string, chatBody []byte, stickyKey string) ([]byte, *accounts.Account, error) {
-	targets, err := s.router.ResolveTargets(requestedModel)
+	targets, err := s.resolveRouteTargets(requestedModel)
 	if err != nil {
-		return nil, nil, &protocol.UpstreamError{
-			HTTPStatus: http.StatusBadRequest,
-			Kind:       protocol.ErrorKindClient,
-			Message:    err.Error(),
-		}
+		return nil, nil, err
 	}
 
 	retryCfg := s.cfgMgr.Get().Retry
@@ -211,11 +207,7 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 			if lastErr != nil {
 				return nil, nil, lastErr
 			}
-			return nil, nil, &protocol.UpstreamError{
-				HTTPStatus: http.StatusServiceUnavailable,
-				Kind:       protocol.ErrorKindTransient,
-				Message:    fmt.Sprintf("模型 %s 暂无可用就绪账号（请检查账号池状态或稍后重试）", requestedModel),
-			}
+			return nil, nil, s.noReadyAccountError(targets, requestedModel)
 		}
 		triedAccounts[acc.ID] = true
 
@@ -252,7 +244,7 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 		lastErr = errCall
 		var uerr *protocol.UpstreamError
 		if errors.As(errCall, &uerr) {
-			s.pool.ReportError(acc.ID, uerr)
+			s.pool.ReportErrorForModel(acc.ID, target.UpstreamModel, uerr)
 			if s.logger != nil {
 				s.logger.Warn("Gateway", "账号 [%s] (%s) 调用模型 %s 失败 [%s]: %s",
 					acc.Cred.DisplayLabel(), target.Region, target.UpstreamModel, uerr.Kind, uerr.Message)
@@ -277,13 +269,9 @@ func (s *Server) executeChatWithFailover(ctx context.Context, requestedModel str
 
 // executeChatStreamWithFailover 执行带短时会话粘性与自动切号故障转移的流式 SSE 请求。
 func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedModel string, chatBody []byte, stickyKey string) (*http.Response, *accounts.Account, error) {
-	targets, err := s.router.ResolveTargets(requestedModel)
+	targets, err := s.resolveRouteTargets(requestedModel)
 	if err != nil {
-		return nil, nil, &protocol.UpstreamError{
-			HTTPStatus: http.StatusBadRequest,
-			Kind:       protocol.ErrorKindClient,
-			Message:    err.Error(),
-		}
+		return nil, nil, err
 	}
 
 	retryCfg := s.cfgMgr.Get().Retry
@@ -297,11 +285,7 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 			if lastErr != nil {
 				return nil, nil, lastErr
 			}
-			return nil, nil, &protocol.UpstreamError{
-				HTTPStatus: http.StatusServiceUnavailable,
-				Kind:       protocol.ErrorKindTransient,
-				Message:    fmt.Sprintf("模型 %s 暂无可用就绪账号（请检查账号池状态或稍后重试）", requestedModel),
-			}
+			return nil, nil, s.noReadyAccountError(targets, requestedModel)
 		}
 		triedAccounts[acc.ID] = true
 
@@ -332,7 +316,7 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 		lastErr = errCall
 		var uerr *protocol.UpstreamError
 		if errors.As(errCall, &uerr) {
-			s.pool.ReportError(acc.ID, uerr)
+			s.pool.ReportErrorForModel(acc.ID, target.UpstreamModel, uerr)
 			if s.logger != nil {
 				s.logger.Warn("Gateway", "账号 [%s] (%s) 流式调用模型 %s 失败 [%s]: %s",
 					acc.Cred.DisplayLabel(), target.Region, target.UpstreamModel, uerr.Kind, uerr.Message)
@@ -354,12 +338,47 @@ func (s *Server) executeChatStreamWithFailover(ctx context.Context, requestedMod
 	return nil, nil, lastErr
 }
 
+// resolveRouteTargets 解析路由目标；账号池无有效账号时按 503 瞬态错误返回，避免被误判为模型不存在。
+func (s *Server) resolveRouteTargets(requestedModel string) ([]accounts.RouteTarget, error) {
+	targets, err := s.router.ResolveTargets(requestedModel)
+	if err != nil {
+		status := http.StatusBadRequest
+		kind := protocol.ErrorKindClient
+		if errors.Is(err, accounts.ErrNoActiveAccount) {
+			status = http.StatusServiceUnavailable
+			kind = protocol.ErrorKindTransient
+		}
+		return nil, &protocol.UpstreamError{HTTPStatus: status, Kind: kind, Message: err.Error()}
+	}
+	return targets, nil
+}
+
+// noReadyAccountError 在切号候选耗尽时区分「模型额度冷却」与「账号暂不可用」。
+func (s *Server) noReadyAccountError(targets []accounts.RouteTarget, requestedModel string) error {
+	for _, target := range targets {
+		if remain, cooling := s.pool.ModelQuotaCooldown(target.UpstreamModel); cooling {
+			secs := int(remain.Seconds()) + 1
+			return &protocol.UpstreamError{
+				HTTPStatus: http.StatusPaymentRequired,
+				Kind:       protocol.ErrorKindHardCredit,
+				Message:    fmt.Sprintf("模型 %s 上游免费额度已耗尽，预计 %d 秒后自动重试", requestedModel, secs),
+				RetryAfter: remain,
+			}
+		}
+	}
+	return &protocol.UpstreamError{
+		HTTPStatus: http.StatusServiceUnavailable,
+		Kind:       protocol.ErrorKindTransient,
+		Message:    fmt.Sprintf("模型 %s 暂无可用就绪账号（请检查账号池状态或稍后重试）", requestedModel),
+	}
+}
+
 func (s *Server) pickNextAccount(targets []accounts.RouteTarget, stickyKey string, exclude map[string]bool) (*accounts.Account, accounts.RouteTarget, bool) {
 	if stickyKey != "" && len(targets) > 1 {
 		if stickyRegion, ok := s.pool.StickyAccountRegion(stickyKey, exclude); ok {
 			for _, target := range targets {
 				if target.Region == stickyRegion {
-					if acc, acquired := s.pool.AcquireSticky(target.Region, stickyKey, exclude); acquired {
+					if acc, acquired := s.pool.AcquireStickyForModel(target.Region, stickyKey, exclude, target.UpstreamModel); acquired {
 						return acc, target, true
 					}
 				}
@@ -367,7 +386,7 @@ func (s *Server) pickNextAccount(targets []accounts.RouteTarget, stickyKey strin
 		}
 	}
 	for _, target := range targets {
-		if acc, ok := s.pool.AcquireSticky(target.Region, stickyKey, exclude); ok {
+		if acc, ok := s.pool.AcquireStickyForModel(target.Region, stickyKey, exclude, target.UpstreamModel); ok {
 			return acc, target, true
 		}
 	}

@@ -686,6 +686,8 @@ footer{
                 <span class="dim">每</span>
                 <input type="number" id="mhProbeMin" min="1" max="1440" value="10" style="width:76px">
                 <span class="dim">分钟</span>
+                <span class="dim" style="margin-left:8px">最大映射节点数</span>
+                <input type="number" id="mhMaxNodes" min="1" max="5000" value="2000" style="width:86px" title="默认 2000，最多 5000；节点越多，mihomo 启动与资源占用越高">
               </div>
             </div>
           </div>
@@ -693,6 +695,9 @@ footer{
           <div class="toolbar">
             <button class="btn primary" id="btnMhSaveSub" onclick="saveMihomoSubscriptions()">保存订阅并拉取节点</button>
             <button class="btn" id="btnMhProbe" onclick="probeMihomoNodes()">⚡ 一键测速</button>
+            <button class="btn danger" id="btnMhDeleteSel" onclick="deleteMihomoNodes()">🗑 删除选中节点</button>
+            <button class="btn" id="btnMhToPool" onclick="mihomoNodesToPool()">→ 加入代理节点池</button>
+            <button class="btn" id="btnMhRestore" onclick="restoreMihomoNodes()" style="display:none">↺ 恢复已删除节点</button>
             <span class="dim" id="mhNodeSummary" style="margin-left:auto">真实节点 0 个</span>
           </div>
 
@@ -700,6 +705,7 @@ footer{
             <table class="data">
               <thead>
                 <tr>
+                  <th style="width:34px"><input type="checkbox" id="mhChkAll" onchange="toggleMihomoSelectAll(this.checked)" title="全选 / 取消全选"></th>
                   <th>机场节点名称</th>
                   <th>本地回环 mixed 端口</th>
                   <th>测速延迟</th>
@@ -707,7 +713,7 @@ footer{
                 </tr>
               </thead>
               <tbody id="mhNodesTbody">
-                <tr><td colspan="4" class="dim">尚未导入机场订阅节点；请先下载 mihomo 内核并填入订阅链接。</td></tr>
+                <tr><td colspan="5" class="dim">尚未导入机场订阅节点；请先下载 mihomo 内核并填入订阅链接。</td></tr>
               </tbody>
             </table>
           </div>
@@ -1208,6 +1214,26 @@ footer{
       <button class="btn primary" onclick="submitProxyImport()">开始解析并导入</button>
     </div>
     <div id="proxyImportReport"></div>
+  </div>
+</div>
+
+<!-- 机场节点转代理池弹窗 -->
+<div class="modal-mask" id="mhToPoolModal" onclick="if(event.target.id==='mhToPoolModal')closeMihomoToPoolModal()">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>把机场节点加入代理节点池</h3>
+      <button class="btn sm" onclick="closeMihomoToPoolModal()">✕ 关闭</button>
+    </div>
+    <div class="dim" style="margin-bottom:10px;font-size:12px">
+      选中的机场节点会以 <span class="hl">http://127.0.0.1:&lt;端口&gt;</span> 形式写入代理节点池，可直接用于日常对话 / 刷新 / 签到。
+      删除对应机场节点或更换订阅导致端口变化后，池节点会失效。
+    </div>
+    <div class="log-box" id="mhToPoolList" style="max-height:220px"></div>
+    <div class="toolbar" style="margin-top:12px">
+      <button class="btn" onclick="closeMihomoToPoolModal()">取消</button>
+      <button class="btn primary" id="btnMhToPoolConfirm" onclick="submitMihomoNodesToPool()">确认加入</button>
+    </div>
+    <div id="mhToPoolReport"></div>
   </div>
 </div>
 
@@ -1899,24 +1925,36 @@ function renderMihomoSnapshot(ms){
   if (apEl) apEl.checked = ms.auto_probe_enabled !== false;
   const pmEl = document.getElementById('mhProbeMin');
   if (pmEl && document.activeElement !== pmEl) pmEl.value = ms.auto_probe_interval_min || 10;
+  const mnEl = document.getElementById('mhMaxNodes');
+  if (mnEl && document.activeElement !== mnEl) mnEl.value = ms.max_nodes || 2000;
 
   const summaryEl = document.getElementById('mhNodeSummary');
   if (summaryEl){
     const fakeTxt = ms.filtered_fake_count > 0 ? `（已过滤 ${ms.filtered_fake_count} 个假节点）` : '';
     const lastTxt = ms.last_probe_at ? ` · 最近测速 ${ms.last_probe_at}` : '';
     const probingTxt = ms.probing ? ' · 测速中…' : '';
-    summaryEl.textContent = `真实节点 ${ms.total_count||0} 个（可用 ${ms.healthy_count||0} 个）${fakeTxt}${lastTxt}${probingTxt}`;
+    const excludedTxt = ms.excluded_count > 0 ? ` · 已删除 ${ms.excluded_count} 个（可恢复）` : '';
+    summaryEl.textContent = `真实节点 ${ms.total_count||0} 个（可用 ${ms.healthy_count||0} 个）${fakeTxt}${excludedTxt}${lastTxt}${probingTxt}`;
+  }
+  const restoreBtn = document.getElementById('btnMhRestore');
+  if (restoreBtn){
+    const cnt = ms.excluded_count || 0;
+    restoreBtn.style.display = cnt > 0 ? '' : 'none';
+    restoreBtn.textContent = `↺ 恢复已删除节点 (${cnt})`;
   }
 
   const tbody = document.getElementById('mhNodesTbody');
   const nodes = Array.isArray(ms.nodes) ? ms.nodes : [];
+  const chkAll = document.getElementById('mhChkAll');
+  if (chkAll) chkAll.checked = false;
   if (tbody){
     if (!nodes.length){
-      tbody.innerHTML = '<tr><td colspan="4" class="dim">尚未导入机场订阅节点；请先下载 mihomo 内核并填入订阅链接。</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" class="dim">尚未导入机场订阅节点；请先下载 mihomo 内核并填入订阅链接。</td></tr>';
     } else {
       tbody.innerHTML = nodes.map(n => {
         const lat = n.delay > 0 ? `<span class="ok">${n.delay} ms</span>` : (n.delay < 0 ? '<span class="err">× 超时</span>' : '<span class="dim">— 待测速</span>');
         return `<tr>
+          <td><input type="checkbox" class="mh-chk" value="${esc(n.name)}"></td>
           <td class="hl">${esc(n.name)}</td>
           <td class="dim">127.0.0.1:${esc(n.port)}</td>
           <td>${lat}</td>
@@ -1972,12 +2010,13 @@ async function saveMihomoSubscriptions(){
   const enabled = document.getElementById('mhEnabled').checked || hasSub;
   const auto_probe_enabled = document.getElementById('mhAutoProbe').checked;
   const auto_probe_interval_min = Math.max(1, Math.min(1440, parseInt(document.getElementById('mhProbeMin').value, 10) || 10));
+  const max_nodes = Math.max(1, Math.min(5000, parseInt(document.getElementById('mhMaxNodes').value, 10) || 2000));
   if (btn) btn.disabled = true;
   try{
     toast('正在保存订阅配置并同步机场节点…');
     const res = await apiFetch('/api/admin/mihomo/config', {
       method:'PUT',
-      body: JSON.stringify({ enabled, subscriptions: subs, auto_probe_enabled, auto_probe_interval_min })
+      body: JSON.stringify({ enabled, subscriptions: subs, auto_probe_enabled, auto_probe_interval_min, max_nodes })
     });
     toast(res.message);
     if (res.snapshot) renderMihomoSnapshot(res.snapshot);
@@ -1985,6 +2024,101 @@ async function saveMihomoSubscriptions(){
     setTimeout(() => { loadMihomoStatus(); }, 3500);
   } catch(e){
     toast(e.message, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+function toggleMihomoSelectAll(checked){
+  document.querySelectorAll('.mh-chk').forEach(c => c.checked = checked);
+}
+function selectedMihomoNodeNames(){
+  return Array.from(document.querySelectorAll('.mh-chk:checked')).map(c => c.value);
+}
+async function deleteMihomoNodes(){
+  const names = selectedMihomoNodeNames();
+  if (!names.length){ toast('请先勾选需要删除的机场节点', true); return; }
+  if (!confirm(`确定删除选中的 ${names.length} 个机场节点吗？删除后会释放其本地端口并退出登录轮换，可在「恢复已删除节点」中找回。`)) return;
+  const btn = document.getElementById('btnMhDeleteSel');
+  if (btn) btn.disabled = true;
+  try{
+    toast('正在删除节点并重建 mihomo 监听端口…');
+    const res = await apiFetch('/api/admin/mihomo/nodes/delete', { method:'POST', body: JSON.stringify({ names }) });
+    toast(res.message);
+    if (res.snapshot) renderMihomoSnapshot(res.snapshot);
+    await Promise.all([loadProxies(), loadOverview()]);
+  } catch(e){
+    toast('删除节点失败: ' + e.message, true);
+    await loadMihomoStatus();
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+let mhToPoolNames = [];
+function mihomoNodesToPool(){
+  const names = selectedMihomoNodeNames();
+  if (!names.length){ toast('请先勾选要加入代理节点池的机场节点', true); return; }
+  mhToPoolNames = names;
+  const allNodes = (cachedMihomo && Array.isArray(cachedMihomo.nodes)) ? cachedMihomo.nodes : [];
+  const picked = allNodes.filter(n => names.includes(n.name));
+  const listEl = document.getElementById('mhToPoolList');
+  listEl.innerHTML = picked.length
+    ? picked.map(n => {
+        const lat = n.delay > 0 ? `<span class="ok">${n.delay} ms</span>` : (n.delay < 0 ? '<span class="err">× 超时</span>' : '<span class="dim">待测速</span>');
+        return `<div class="log-line"><span class="hl">${esc(n.name)}</span> → <span class="dim">127.0.0.1:${esc(n.port)}</span> · ${lat}</div>`;
+      }).join('')
+    : '<div class="dim">所选节点已不在当前列表中，请刷新后重试。</div>';
+  const btn = document.getElementById('btnMhToPoolConfirm');
+  if (btn){ btn.disabled = !picked.length; btn.textContent = `确认加入 (${picked.length})`; }
+  document.getElementById('mhToPoolReport').innerHTML = '';
+  document.getElementById('mhToPoolModal').classList.add('open');
+}
+function closeMihomoToPoolModal(){
+  document.getElementById('mhToPoolModal').classList.remove('open');
+}
+async function submitMihomoNodesToPool(){
+  const names = mhToPoolNames.slice();
+  if (!names.length) return;
+  const btn = document.getElementById('btnMhToPoolConfirm');
+  if (btn){ btn.disabled = true; btn.textContent = '正在加入…'; }
+  try{
+    const res = await apiFetch('/api/admin/mihomo/nodes/to-pool', { method:'POST', body: JSON.stringify({ names }) });
+    toast(res.message);
+    const s = res.summary || {};
+    const items = s.items || [];
+    const statusMap = {
+      added: '<span class="ok">已加入</span>',
+      duplicate: '<span class="warn">已存在</span>',
+      unsupported: '<span class="warn">不支持</span>',
+      invalid: '<span class="err">无效</span>'
+    };
+    document.getElementById('mhToPoolReport').innerHTML = `
+      <div class="ln" style="margin:10px 0 6px">${esc(res.message)}</div>
+      ${items.length ? `<div class="log-box" style="max-height:180px">
+        ${items.map(it => `<div class="log-line">[${statusMap[it.status]||esc(it.status)}] ${esc(it.name||'')}${it.reason ? ' — ' + esc(it.reason) : ''}</div>`).join('')}
+      </div>` : ''}`;
+    document.querySelectorAll('.mh-chk').forEach(c => c.checked = false);
+    const chk = document.getElementById('mhChkAll'); if (chk) chk.checked = false;
+    if (btn) btn.textContent = s.added > 0 ? '✓ 已加入，可关闭' : '无新增，可关闭';
+    await Promise.all([loadProxies(), loadOverview()]);
+  } catch(e){
+    toast('加入代理节点池失败: ' + e.message, true);
+    if (btn){ btn.disabled = false; btn.textContent = '确认加入'; }
+  }
+}
+async function restoreMihomoNodes(){
+  if (!confirm('确定恢复全部已删除的机场节点吗？将重新同步订阅并重建监听端口。')) return;
+  const btn = document.getElementById('btnMhRestore');
+  if (btn) btn.disabled = true;
+  try{
+    toast('正在恢复已删除节点并重新同步订阅…');
+    const res = await apiFetch('/api/admin/mihomo/nodes/restore', { method:'POST' });
+    toast(res.message);
+    if (res.snapshot) renderMihomoSnapshot(res.snapshot);
+    await Promise.all([loadProxies(), loadOverview()]);
+    setTimeout(() => { loadMihomoStatus(); }, 3500);
+  } catch(e){
+    toast('恢复节点失败: ' + e.message, true);
+    await loadMihomoStatus();
   } finally {
     if (btn) btn.disabled = false;
   }

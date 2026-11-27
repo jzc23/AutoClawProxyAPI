@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -229,5 +230,45 @@ func TestPickAndPeekLoginNodeRoundRobinSkipsTimeout(t *testing.T) {
 		if !ok || got.Name != want {
 			t.Fatalf("第 %d 次 Pick 期望 %s，实际 %+v (ok=%v)", i+1, want, got, ok)
 		}
+	}
+}
+
+func TestAssignStableNodePortsSupportsLargeSubscriptions(t *testing.T) {
+	names := make([]string, 1300)
+	for i := range names {
+		names[i] = fmt.Sprintf("节点-%04d", i+1)
+	}
+
+	// 默认上限（2000）应完整映射 1300 个节点，端口从 basePort 连续顺延
+	assigned := AssignStableNodePorts(names, nil, 20001, DefaultMaxNodes)
+	if len(assigned) != len(names) {
+		t.Fatalf("默认上限 %d 应支持 %d 个节点，实际分配 %d 个", DefaultMaxNodes, len(names), len(assigned))
+	}
+	if assigned[0].Port != 20001 || assigned[len(assigned)-1].Port != 20001+len(names)-1 {
+		t.Fatalf("端口应连续分配: first=%d last=%d", assigned[0].Port, assigned[len(assigned)-1].Port)
+	}
+
+	// 显式配置较小的上限时仍按配置截断
+	limited := AssignStableNodePorts(names, nil, 20001, 500)
+	if len(limited) != 500 {
+		t.Fatalf("显式上限 500 应只分配 500 个，实际 %d", len(limited))
+	}
+
+	// 超过硬上限时自动钳制到 MaxNodesLimit
+	clamped := AssignStableNodePorts(names, nil, 20001, MaxNodesLimit+1)
+	if len(clamped) != len(names) {
+		t.Fatalf("钳制到 %d 后应覆盖 %d 个节点，实际 %d", MaxNodesLimit, len(names), len(clamped))
+	}
+
+	// 配置生成不应再按 120 截断，listeners 数量应与节点数一致
+	yml := BuildConfigYAML(ConfigOptions{
+		MixedPort:  17890,
+		Controller: "127.0.0.1:19090",
+		Secret:     "sec",
+		Subs:       []string{"https://airport.example/sub?token=abc"},
+		Nodes:      assigned,
+	})
+	if got := strings.Count(yml, "\n  - name: pub-"); got != len(assigned) {
+		t.Fatalf("listeners 数量应等于节点数 %d，实际 %d", len(assigned), got)
 	}
 }

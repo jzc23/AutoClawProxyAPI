@@ -177,6 +177,43 @@ func TestClassifyErrorRateLimitVsCreditAnd403(t *testing.T) {
 	}
 }
 
+func TestClassifyQuotaExhaustedIsHardCredit(t *testing.T) {
+	quotaBody := `{"code":810000,"message":"GLM-5.3 free quota used up. Subscribe to a membership to continue."}`
+
+	// 1. 非 2xx 响应：调用侧业务码为 0，需从 body 信封补提 810000
+	e1 := ClassifyError(http.StatusForbidden, 0, quotaBody, 0)
+	if e1.Kind != ErrorKindHardCredit || !e1.ModelScoped || e1.BizCode != BizCodeModelQuotaExhausted {
+		t.Fatalf("810000 额度错误应归类为模型级 hard_credit，实际: %+v", e1)
+	}
+	if e1.HTTPStatus != http.StatusPaymentRequired {
+		t.Fatalf("额度错误 HTTPStatus 应归一为 402，实际: %d", e1.HTTPStatus)
+	}
+
+	// 2. 显式携带业务码
+	e2 := ClassifyError(http.StatusForbidden, BizCodeModelQuotaExhausted, quotaBody, 0)
+	if e2.Kind != ErrorKindHardCredit || !e2.ModelScoped {
+		t.Fatalf("显式 810000 应归类为模型级 hard_credit，实际: %+v", e2)
+	}
+
+	// 3. 仅命中额度文案（无业务码）
+	e3 := ClassifyError(http.StatusForbidden, 0, `{"message":"free quota used up, please subscribe to a membership"}`, 0)
+	if e3.Kind != ErrorKindHardCredit || !e3.ModelScoped {
+		t.Fatalf("额度文案应归类为模型级 hard_credit，实际: %+v", e3)
+	}
+
+	// 4. 裸 403（无额度语义）在本 fork 中为 risk_control（风控/WAF 拦截不判会话死亡），而非会话失效
+	e4 := ClassifyError(http.StatusForbidden, 0, `{"message":"Forbidden"}`, 0)
+	if e4.Kind != ErrorKindRiskControl {
+		t.Fatalf("无额度语义的裸 403 应为 risk_control（fork 风控分级），实际: %+v", e4)
+	}
+
+	// 5. HTTP 200 信封携带 810000 时同样归为额度错误（原逻辑会落到 client 不切号）
+	e5 := ClassifyError(http.StatusOK, BizCodeModelQuotaExhausted, quotaBody, 0)
+	if e5.Kind != ErrorKindHardCredit || !e5.ModelScoped {
+		t.Fatalf("200 信封 810000 应归类为模型级 hard_credit，实际: %+v", e5)
+	}
+}
+
 func TestParseModelsConfigBothShapes(t *testing.T) {
 	topLevel := `{"models":[{"id":"glm-5","name":"GLM 5","creditConsumptionLevel":"中","input":["text","image"],"reasoning":true}]}`
 	m1, err := ParseModelsConfigJSON([]byte(topLevel), 200, RegionGlobal)

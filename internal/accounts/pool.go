@@ -25,6 +25,12 @@ const (
 	StatusDead     Status = "dead"     // 会话失效（需重新登录）
 )
 
+// ModelCooldownState 记录单个上游模型在该账号维度的额度冷却状态。
+type ModelCooldownState struct {
+	Until time.Time
+	Kind  string
+}
+
 // Account 代表多账号池中的一个受管账号实体（不设数量上限）。
 type Account struct {
 	ID            string
@@ -35,18 +41,20 @@ type Account struct {
 	SessionDead   bool
 	CooldownUntil time.Time
 	CooldownKind  string
-	LastError     string
-	Balance       float64
-	BalanceKnown  bool
-	BalanceAt       time.Time
+	// ModelCooldowns 按上游模型名（小写）记录模型级额度冷却，不影响同账号其它模型。
+	ModelCooldowns    map[string]ModelCooldownState
+	LastError         string
+	Balance           float64
+	BalanceKnown      bool
+	BalanceAt         time.Time
 	LastCheckin       string // YYYY-MM-DD
 	LastCheckinAt     time.Time
 	LastCheckinPoints int64
 	CheckinStatus     string // done | already | failed | pending
-	CheckinMsg      string
-	TotalRequests   int64
-	LastBalanceReqs int64
-	FailedCount     int64
+	CheckinMsg        string
+	TotalRequests     int64
+	LastBalanceReqs   int64
+	FailedCount       int64
 }
 
 // EffectiveStatus 计算账号在指定时刻的实时状态。
@@ -63,31 +71,46 @@ func (a *Account) EffectiveStatus(now time.Time) Status {
 	return StatusOnline
 }
 
+// normalizeModelCooldownKey 归一化上游模型名，作为模型级冷却键。
+func normalizeModelCooldownKey(model string) string {
+	return strings.ToLower(strings.TrimSpace(model))
+}
+
+// modelCooling 判断账号在指定模型上是否处于额度冷却中。
+func (a *Account) modelCooling(model string, now time.Time) bool {
+	key := normalizeModelCooldownKey(model)
+	if key == "" || len(a.ModelCooldowns) == 0 {
+		return false
+	}
+	st, ok := a.ModelCooldowns[key]
+	return ok && now.Before(st.Until)
+}
+
 // AccountView 是面向 Web 控制台与状态查询的脱敏视图结构。
 type AccountView struct {
-	ID              string          `json:"id"`
-	FileName        string          `json:"file_name"`
-	Label           string          `json:"label"`
-	Alias           string          `json:"alias"`
-	UserName        string          `json:"user_name"`
-	UserID          string          `json:"user_id"`
-	Phone           string          `json:"phone"`
-	Note            string          `json:"note"`
-	Region          protocol.Region `json:"region"`
-	Channel         string          `json:"channel"`
-	Status          Status          `json:"status"`
-	Disabled        bool            `json:"disabled"`
-	SessionDead     bool            `json:"session_dead"`
-	CooldownRemainS int64           `json:"cooldown_remain_sec"`
-	CooldownKind    string          `json:"cooldown_kind,omitempty"`
-	LastError       string          `json:"last_error,omitempty"`
-	ExpiresAt       int64           `json:"expires_at"`
-	TokenMasked     string          `json:"token_masked"`
-	Balance         float64         `json:"balance"`
-	BalanceKnown    bool            `json:"balance_known"`
-	BalanceAt       string          `json:"balance_at,omitempty"`
-	CheckedInToday  bool            `json:"checked_in_today"`
-	CheckinStatus   string          `json:"checkin_status"`
+	ID              string               `json:"id"`
+	FileName        string               `json:"file_name"`
+	Label           string               `json:"label"`
+	Alias           string               `json:"alias"`
+	UserName        string               `json:"user_name"`
+	UserID          string               `json:"user_id"`
+	Phone           string               `json:"phone"`
+	Note            string               `json:"note"`
+	Region          protocol.Region      `json:"region"`
+	Channel         string               `json:"channel"`
+	Status          Status               `json:"status"`
+	Disabled        bool                 `json:"disabled"`
+	SessionDead     bool                 `json:"session_dead"`
+	CooldownRemainS int64                `json:"cooldown_remain_sec"`
+	CooldownKind    string               `json:"cooldown_kind,omitempty"`
+	LastError       string               `json:"last_error,omitempty"`
+	ExpiresAt       int64                `json:"expires_at"`
+	TokenMasked     string               `json:"token_masked"`
+	Balance         float64              `json:"balance"`
+	BalanceKnown    bool                 `json:"balance_known"`
+	BalanceAt       string               `json:"balance_at,omitempty"`
+	CheckedInToday  bool                 `json:"checked_in_today"`
+	CheckinStatus   string               `json:"checkin_status"`
 	CheckinMsg      string               `json:"checkin_msg,omitempty"`
 	TotalRequests   int64                `json:"total_requests"`
 	FailedCount     int64                `json:"failed_count"`
@@ -223,6 +246,7 @@ func (p *Pool) SyncFromDisk() error {
 				// 凭证更新为新 token 后自动解除会话失效和旧冷却
 				cur.SessionDead = false
 				cur.CooldownUntil = time.Time{}
+				cur.ModelCooldowns = nil
 				cur.LastError = ""
 			}
 		} else {
@@ -259,12 +283,22 @@ func (p *Pool) rebuildOrderLocked() {
 
 // Acquire 按轮询策略选择一个可用的就绪账号（region 为空表示双区联合调度，exclude 用于单请求故障切号避让）。
 func (p *Pool) Acquire(region protocol.Region, exclude map[string]bool) (*Account, bool) {
-	return p.AcquireSticky(region, "", exclude)
+	return p.acquire(region, "", exclude, "")
 }
 
 // AcquireSticky 支持按会话粘性键优先命中已绑定的就绪账号（15 分钟滑动有效期，提升上游 Prompt Cache 命中率）；
 // 若已绑定账号处于冷却/失效/被排除，则自动轮询切号并改绑至新账号。
 func (p *Pool) AcquireSticky(region protocol.Region, stickyKey string, exclude map[string]bool) (*Account, bool) {
+	return p.acquire(region, stickyKey, exclude, "")
+}
+
+// AcquireStickyForModel 在 AcquireSticky 基础上排除该模型已额度冷却的账号，
+// 避免单个模型的免费额度耗尽影响同账号下其它模型的调度。
+func (p *Pool) AcquireStickyForModel(region protocol.Region, stickyKey string, exclude map[string]bool, model string) (*Account, bool) {
+	return p.acquire(region, stickyKey, exclude, model)
+}
+
+func (p *Pool) acquire(region protocol.Region, stickyKey string, exclude map[string]bool, model string) (*Account, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -281,7 +315,8 @@ func (p *Pool) AcquireSticky(region protocol.Region, stickyKey string, exclude m
 				if exclude == nil || !exclude[b.accountID] {
 					if acc, exists := p.items[b.accountID]; exists &&
 						(region == "" || acc.Cred.Region == region) &&
-						acc.EffectiveStatus(now) == StatusOnline {
+						acc.EffectiveStatus(now) == StatusOnline &&
+						!acc.modelCooling(model, now) {
 						p.sticky[key] = stickyBinding{
 							accountID: acc.ID,
 							expiresAt: now.Add(ttl),
@@ -307,6 +342,9 @@ func (p *Pool) AcquireSticky(region protocol.Region, stickyKey string, exclude m
 			continue
 		}
 		if acc.EffectiveStatus(now) != StatusOnline {
+			continue
+		}
+		if acc.modelCooling(model, now) {
 			continue
 		}
 		candidates = append(candidates, acc)
@@ -401,6 +439,16 @@ func (p *Pool) ReportSuccess(id string) {
 
 // ReportError 根据错误分级更新账号冷却或失效状态。
 func (p *Pool) ReportError(id string, uerr *protocol.UpstreamError) {
+	p.reportError(id, "", uerr)
+}
+
+// ReportErrorForModel 在 ReportError 基础上支持模型级额度冷却：
+// 当错误被标记为 ModelScoped（模型免费额度耗尽）时，仅冷却该模型，账号仍可服务其它模型。
+func (p *Pool) ReportErrorForModel(id, model string, uerr *protocol.UpstreamError) {
+	p.reportError(id, model, uerr)
+}
+
+func (p *Pool) reportError(id, model string, uerr *protocol.UpstreamError) {
 	if uerr == nil {
 		return
 	}
@@ -415,6 +463,23 @@ func (p *Pool) ReportError(id string, uerr *protocol.UpstreamError) {
 	acc.LastError = uerr.Message
 
 	now := time.Now()
+	modelKey := ""
+	if uerr.Kind == protocol.ErrorKindHardCredit && uerr.ModelScoped {
+		modelKey = normalizeModelCooldownKey(model)
+	}
+	if modelKey != "" {
+		dur := time.Duration(retryCfg.LongCooldownSec) * time.Second
+		if uerr.RetryAfter > dur {
+			dur = uerr.RetryAfter
+		}
+		if acc.ModelCooldowns == nil {
+			acc.ModelCooldowns = make(map[string]ModelCooldownState)
+		}
+		p.pruneModelCooldownsLocked(acc, now)
+		acc.ModelCooldowns[modelKey] = ModelCooldownState{Until: now.Add(dur), Kind: "hard_credit"}
+		return
+	}
+
 	switch uerr.Kind {
 	case protocol.ErrorKindSessionDead:
 		acc.SessionDead = true
@@ -443,6 +508,44 @@ func (p *Pool) ReportError(id string, uerr *protocol.UpstreamError) {
 		acc.CooldownUntil = now.Add(dur)
 		acc.CooldownKind = "soft_rate"
 	}
+}
+
+// pruneModelCooldownsLocked 清理已过期的模型级冷却条目，控制内存占用有界。
+func (p *Pool) pruneModelCooldownsLocked(acc *Account, now time.Time) {
+	for key, st := range acc.ModelCooldowns {
+		if !now.Before(st.Until) {
+			delete(acc.ModelCooldowns, key)
+		}
+	}
+}
+
+// ModelQuotaCooldown 返回指定上游模型在池内最早的剩余额度冷却时间（用于对外返回额度类错误）。
+func (p *Pool) ModelQuotaCooldown(model string) (time.Duration, bool) {
+	key := normalizeModelCooldownKey(model)
+	if key == "" {
+		return 0, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	var best time.Duration
+	found := false
+	for _, acc := range p.items {
+		// 已停用或已失效账号不参与调度，其残留的模型冷却不应影响对外错误判定。
+		if acc.Cred.Disabled || acc.SessionDead {
+			continue
+		}
+		st, ok := acc.ModelCooldowns[key]
+		if !ok || !now.Before(st.Until) {
+			continue
+		}
+		remain := st.Until.Sub(now)
+		if !found || remain < best {
+			best = remain
+			found = true
+		}
+	}
+	return best, found
 }
 
 // GetByID 获取指定账号的快照副本。
@@ -631,6 +734,7 @@ func (p *Pool) ApplyRefreshedTokens(id, accessToken, refreshToken string, expire
 		}
 		cur.SessionDead = false
 		cur.CooldownUntil = time.Time{}
+		cur.ModelCooldowns = nil
 		cur.LastError = ""
 		if info != nil {
 			cur.FileModTime = info.ModTime()
@@ -717,6 +821,7 @@ func (p *Pool) UpdateMeta(id string, alias, note *string, disabled *bool) error 
 				// 手动重新启用时解除冷却与失效标记便于立刻复测
 				cur.CooldownUntil = time.Time{}
 				cur.SessionDead = false
+				cur.ModelCooldowns = nil
 				cur.LastError = ""
 			}
 		}

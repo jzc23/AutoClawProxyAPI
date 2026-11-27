@@ -61,6 +61,9 @@ const (
 	BizCodeNotLoggedIn = 410000
 	BizCodeAuthExpired = 400000
 
+	// BizCodeModelQuotaExhausted 表示上游单个模型的免费额度已耗尽（需订阅会员继续使用）。
+	BizCodeModelQuotaExhausted = 810000
+
 	// DefaultTokenTTL 是上游未显式返回 expires_in 时的令牌保守有效时长（28 天）。
 	DefaultTokenTTL = 28 * 24 * time.Hour
 )
